@@ -28,3 +28,17 @@ debug_out.txt
 .DS_Store
 Thumbs.db
 
+
+# Dữ liệu huấn luyện lại mô hình (tools/helmet_*.py) và kết quả train của Ultralytics
+dataset/
+runs/
+
+# Cấu hình bí mật (mật khẩu database...) — chỉ đẩy file mẫu .env.example
+.env
+.env.*
+!.env.example
+
+# Dữ liệu người dùng / kết quả phân tích (backend tự tạo lại thư mục khi khởi động)
+static/uploads/
+static/outputs/
+static/evidence/

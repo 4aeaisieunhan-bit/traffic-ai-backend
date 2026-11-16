@@ -1,6 +1,8 @@
-from ultralytics import YOLO 
+from ultralytics import YOLO
+from ultralytics.engine.results import Results
+from models.yolo_types import INFER_KW, as_results 
 model = YOLO("weights/vehicle-26s-best.pt")
-def detect_vehicle(image, track=True):
+def detect_vehicle(image, track=True) -> list[Results]:
     if track:
         result = model.track(
             source=image,
@@ -8,15 +10,17 @@ def detect_vehicle(image, track=True):
             tracker="bytetrack.yaml",
             conf=0.25,
             verbose=False,
+            **INFER_KW,
         )
     else:
         result = model.predict(
             source=image,
             conf=0.25,
             verbose=False,
+            **INFER_KW,
         )
-    return result
+    return as_results(result)
 
 
-def track_vehicle(image):
-    return detect_vehicle(image, track=True)
+def track_vehicle(image) -> list[Results]:
+    return detect_vehicle(image, track=True)

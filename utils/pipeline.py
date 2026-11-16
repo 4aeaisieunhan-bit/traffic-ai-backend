@@ -1,0 +1,173 @@
+# utils/pipeline.py
+# Pipeline phân tích 1 khung hình — DÙNG CHUNG cho:
+#   - main.py           (chạy dòng lệnh, ghi output.mp4 + in bảng tổng kết)
+#   - api/analyze.py    (phân tích từ giao diện web, lưu vi phạm vào database)
+# => Thêm / sửa tính năng nhận diện chỉ cần sửa 1 chỗ, hai luồng luôn cho kết quả giống nhau.
+#
+# Mỗi khung hình: chuẩn hoá 1280x720 + tăng nét -> 6 mô hình YOLO -> vạch dừng + ROI -> theo dõi quỹ đạo (vượt đèn)
+# -> biển số -> vi phạm không đội mũ (toàn khung hình) -> vẽ khung + HUD -> ghép sidebar.
+import os
+from dataclasses import dataclass, field
+
+import cv2
+
+# Mô hình dùng trong pipeline: key -> (tên hiển thị, file weights, module)
+MODEL_INFO = {
+    "Vehicle": ("Vehicle Detector + ByteTrack", "vehicle-26s-best.pt", "models.vehicle"),
+    "Traffic Light": ("Traffic Light Classifier", "light_traffic-26m-best.pt", "models.traffic_light"),
+    "Helmet": ("Helmet Detector", os.path.basename(os.getenv("HELMET_WEIGHTS", "helmet_26s.pt")), "models.helmet"),
+    "License Plate": ("License Plate Detector", "LP-26s-best.pt", "models.license_plate"),
+    "Traffic Sign": ("Traffic Sign Detector", "OCR-26s-best.pt", "models.traffic_sign"),
+    "Stop Line": ("Stop Line Detector", "stop_line-26s-best.pt", "models.stop_line"),
+}
+
+PROCESS_SIZE = (1280, 720)     # xử lý ở 1280x720: nhanh hơn ~5 lần so với 4K, ngưỡng thuật toán ổn định
+SIDEBAR_WIDTH = 416            # 1280 + 416 = 1696 chia hết cho 16 -> nén video không lỗi macroblock
+
+
+@dataclass
+class FrameResult:
+    canvas: "cv2.typing.MatLike"                 # khung hình đã vẽ + sidebar (ghi vào video kết quả)
+    new_violations: list = field(default_factory=list)   # vi phạm MỚI ghi nhận ở khung hình này
+    evidence_frame: "cv2.typing.MatLike | None" = None   # khung hình 720p (chưa vẽ HUD) để lưu ảnh bằng chứng
+    orig_frame: "cv2.typing.MatLike | None" = None
+    clean_frame: "cv2.typing.MatLike | None" = None      # ảnh mô hình nhìn thấy (chưa vẽ gì) -> mẫu huấn luyện
+
+
+def reset_vehicle_tracker():
+    """Xoá trạng thái ByteTrack còn sót từ video trước (model.track dùng persist=True)."""
+    from models.vehicle import model as vehicle_model
+    predictor = getattr(vehicle_model, "predictor", None)
+    for tracker in getattr(predictor, "trackers", None) or []:
+        tracker.reset()
+
+
+class TrafficPipeline:
+    def __init__(self, fps: float):
+        # Nạp mô hình khi tạo pipeline (không làm chậm lúc khởi động server)
+        from models.traffic_light import detect_traffic_light
+        from models.license_plate import detect_license_plate
+        from models.traffic_sign import detect_traffic_sign
+        from models.vehicle import detect_vehicle
+        from models.stop_line import detect_stopline
+        from models.helmet import detect_helmet
+        from utils.traffic_violation import TrafficViolationTracker
+        from utils.helmet_violation import HelmetViolationDetector
+        from utils.violation_sidebar import ViolationSidebar
+
+        self._detect = {
+            "Stop Line": detect_stopline,
+            "Traffic Light": detect_traffic_light,
+            "Helmet": detect_helmet,
+            "License Plate": detect_license_plate,
+            "Traffic Sign": detect_traffic_sign,
+            "Vehicle": lambda f: detect_vehicle(f, track=True),
+        }
+        self.fps = fps
+        self.width, self.height = PROCESS_SIZE
+        self.sidebar = ViolationSidebar(sidebar_width=SIDEBAR_WIDTH, height=self.height, fps=fps, max_cards=4)
+        # Vượt đèn đỏ: quan sát quỹ đạo tối đa 3 s, lệch ngang 25 px = rẽ, tiến sâu 150 px = đi thẳng
+        self.tracker = TrafficViolationTracker(fps=fps, observe_seconds=3.0, turn_threshold_px=25, deep_threshold_px=150)
+        self.helmet_detector = HelmetViolationDetector(fps=fps)   # không đội mũ — toàn khung hình
+        self.active_stopline = None
+        self.stats = {k: {"detections": 0, "conf_sum": 0.0} for k in MODEL_INFO}
+        self.no_helmet_conf: dict[int, float] = {}               # track_id -> độ tin cậy no_helmet TB (0..1)
+        # track_id -> {detections, violator_heads}: khung đầu ở frame kết luận vi phạm mũ (utils/helmet_dataset.py)
+        self.helmet_samples: dict[int, dict] = {}
+        reset_vehicle_tracker()
+
+    @property
+    def output_size(self) -> tuple[int, int]:
+        return self.width + self.sidebar.sidebar_width, self.height
+
+    # ───────────────────────────── 1 khung hình ─────────────────────────────
+    def process(self, raw_frame, frame_idx: int) -> FrameResult:
+        from utils.draw_detections import NO_HELMET_COLOR, draw_detections
+        from utils.frame_enhance import enhance_frame
+        from utils.helmet_dataset import helmet_detections
+        from utils.helmet_violation import make_subject_crop
+        from utils.ROI import draw_stopline_rois
+
+        W, H = self.width, self.height
+        orig_frame = raw_frame                                   # giữ khung gốc (có thể 4K) để crop biển số nét
+        frame = raw_frame
+        if (frame.shape[1], frame.shape[0]) != (W, H):
+            frame = cv2.resize(orig_frame, (W, H), interpolation=cv2.INTER_AREA)
+        frame = enhance_frame(frame, sharpen_amount=0.30, contrast_clip=1.4)
+        clean = frame.copy()                                     # trước khi vẽ ROI / khung (mẫu huấn luyện)
+
+        # 6 mô hình YOLO
+        res = {key: list(fn(frame)) for key, fn in self._detect.items()}
+        for key, r in res.items():
+            boxes = r[0].boxes if r else None
+            if boxes is not None and len(boxes) > 0:
+                self.stats[key]["detections"] += len(boxes)
+                self.stats[key]["conf_sum"] += float(boxes.conf.sum())
+        vehicle, light, helmet, plate = res["Vehicle"][0], res["Traffic Light"][0], res["Helmet"][0], res["License Plate"][0]
+
+        # Vạch dừng: chọn khung tin cậy nhất nằm trong khoảng 35–65% chiều cao, giữ lại khi mất dấu
+        sl = res["Stop Line"][0]
+        if sl.boxes is not None and len(sl.boxes) > 0:
+            valid = [b for b in sl.boxes if H * 0.35 <= float(b.xyxy[0][1]) <= H * 0.65]
+            if valid:
+                self.active_stopline = tuple(map(int, max(valid, key=lambda b: float(b.conf[0])).xyxy[0].tolist()))
+        top_roi = bottom_roi = None
+        if self.active_stopline is not None:
+            top_roi, bottom_roi = draw_stopline_rois(frame, self.active_stopline, top_label="", bottom_label="")
+
+        # Vượt đèn đỏ (quỹ đạo) + biển số
+        self.tracker.update(
+            frame_idx=frame_idx, vehicle_boxes=vehicle.boxes, vehicle_names=vehicle.names,
+            traffic_light_boxes=light.boxes, light_names=light.names,
+            stopline_bbox=self.active_stopline, top_roi=top_roi, bottom_roi=bottom_roi,
+        )
+        rec_boxes = self.tracker.get_recognized_boxes(vehicle.boxes)
+        self.sidebar.update_plates(rec_boxes, plate.boxes, frame, frame_idx, orig_frame=orig_frame)
+        prev_count = len(self.sidebar.violations_history)
+        self.sidebar.check_violations(self.tracker, frame, frame_idx, orig_frame=orig_frame)
+
+        # Không đội mũ bảo hiểm (mọi xe máy trên toàn khung hình)
+        for hv in self.helmet_detector.update(frame_idx, vehicle.boxes, vehicle.names, helmet.boxes, helmet.names):
+            self.sidebar.record_violation(
+                hv["track_id"], hv["cls_name"], hv["reason"], hv["bbox"], frame, frame_idx,
+                orig_frame=orig_frame, kind="NO_HELMET",
+                subject_crop=make_subject_crop(frame, hv["bbox"], hv["head_boxes"], orig_frame=orig_frame),
+            )
+            self.no_helmet_conf[hv["track_id"]] = hv["confidence"]
+            self.helmet_samples[hv["track_id"]] = {"detections": helmet_detections(helmet),
+                                                   "violator_heads": list(hv["head_boxes"])}
+
+        new_items = self.sidebar.violations_history[: len(self.sidebar.violations_history) - prev_count]
+        evidence_frame = frame.copy() if new_items else None     # ảnh bằng chứng: trước khi vẽ HUD / khung
+
+        # Vẽ: quỹ đạo + HUD -> đèn, mũ (khung vi phạm = chính khung mũ của mô hình), biển báo, biển số, vạch dừng
+        frame = self.tracker.draw_visuals(
+            frame, frame_idx,
+            extra_lines=[(f"Khong doi mu bao hiem: {self.helmet_detector.violation_count} xe", NO_HELMET_COLOR)],
+        )
+        frame = draw_detections(
+            frame,
+            traffic_light_result=res["Traffic Light"], helmet_result=res["Helmet"],
+            traffic_sign_result=res["Traffic Sign"], license_plate_result=res["License Plate"],
+            recognized_vehicle_boxes=rec_boxes, active_stopline=self.active_stopline,
+            helmet_violation_boxes=self.helmet_detector.violation_heads(frame_idx),
+        )
+        canvas = self.sidebar.render(frame, frame_idx)
+        return FrameResult(canvas=canvas, new_violations=new_items, evidence_frame=evidence_frame, orig_frame=orig_frame,
+                           clean_frame=clean if new_items else None)
+
+    # ───────────────────────────── thống kê ─────────────────────────────
+    def avg_conf_pct(self, key: str) -> float | None:
+        s = self.stats[key]
+        return round(s["conf_sum"] / s["detections"] * 100, 1) if s["detections"] else None
+
+    def model_stats(self) -> dict:
+        """{key: {weight, detections, avg_confidence (0..1) | None}}"""
+        return {
+            key: {
+                "weight": MODEL_INFO[key][1],
+                "detections": s["detections"],
+                "avg_confidence": round(s["conf_sum"] / s["detections"], 4) if s["detections"] else None,
+            }
+            for key, s in self.stats.items()
+        }

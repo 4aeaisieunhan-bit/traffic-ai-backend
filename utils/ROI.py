@@ -66,37 +66,45 @@ def get_stopline_rois(
         sl_x2 = max(0, min(sl_x2, w - 1))
 
         # Tọa độ cạnh trên của ROI trên ở đỉnh khung hình (y = 0)
+        # và cạnh dưới của ROI trên ở vị trí stopline (y = y_min)
         if full_width_top:
             top_x1 = 0
             top_x2 = w - 1
+            t_bot_x1 = 0
+            t_bot_x2 = w - 1
         else:
             top_x1 = max(0, min(sl_x1 - exp_top, w - 1))
             top_x2 = max(0, min(sl_x2 + exp_top, w - 1))
+            t_bot_x1 = sl_x1
+            t_bot_x2 = sl_x2
 
         # Tọa độ cạnh dưới của ROI dưới ở đáy khung hình (y = h - 1)
+        # và cạnh trên của ROI dưới ở vị trí stopline (y = y_max)
         if full_width_bottom:
+            b_top_x1 = 0
+            b_top_x2 = w - 1
             bottom_x1 = 0
             bottom_x2 = w - 1
         else:
+            b_top_x1 = sl_x1
+            b_top_x2 = sl_x2
             bottom_x1 = max(0, min(sl_x1 - exp_bottom, w - 1))
             bottom_x2 = max(0, min(sl_x2 + exp_bottom, w - 1))
 
-        # ROI trên (hình thang ngược):
-        # Đỉnh khung hình (y=0) bằng toàn bộ chiều ngang: [top_x1, 0] -> [top_x2, 0]
-        # Chạm stopline (y=y_min): [sl_x2, y_min] -> [sl_x1, y_min]
+        # ROI trên (hình chữ nhật hoặc hình thang theo full_width_top):
+        # Đỉnh khung hình (y=0) -> Vạch dừng (y=y_min)
         top_roi = np.array([
             [top_x1, 0],
             [top_x2, 0],
-            [sl_x2, max(0, min(y_min, h - 1))],
-            [sl_x1, max(0, min(y_min, h - 1))],
+            [t_bot_x2, max(0, min(y_min, h - 1))],
+            [t_bot_x1, max(0, min(y_min, h - 1))],
         ], dtype=np.int32)
 
-        # ROI dưới (hình thang xuôi):
-        # Chạm stopline (y=y_max): [sl_x1, y_max] -> [sl_x2, y_max]
-        # Đáy khung hình (y=h-1) bằng toàn bộ chiều ngang: [bottom_x2, h - 1] -> [bottom_x1, h - 1]
+        # ROI dưới: khi full_width_bottom=True (mặc định), tạo hình chữ nhật bao trọn toàn bộ
+        # chiều ngang khung hình từ vạch dừng xuống đáy màn hình, bao quát 100% tất cả các làn xe tiếp cận.
         bottom_roi = np.array([
-            [sl_x1, max(0, min(y_max, h - 1))],
-            [sl_x2, max(0, min(y_max, h - 1))],
+            [b_top_x1, max(0, min(y_max, h - 1))],
+            [b_top_x2, max(0, min(y_max, h - 1))],
             [bottom_x2, h - 1],
             [bottom_x1, h - 1],
         ], dtype=np.int32)
@@ -128,7 +136,7 @@ def draw_roi(
     roi,
     label="",
     color=(255, 0, 0),
-    thickness=2,
+    thickness=1,
     fill_alpha=0.15,
 ):
     """
@@ -206,7 +214,7 @@ def draw_stopline_rois(
     bottom_label="ROI Bottom",
     color_top=(255, 191, 0),       # Xanh dương sáng (BGR)
     color_bottom=(0, 165, 255),    # Màu cam (BGR)
-    thickness=2,
+    thickness=1,
     fill_alpha=0.18,
 ):
     """
@@ -389,6 +397,7 @@ def is_in_stopline_bbox(
     stopline_bbox=None,
     padding_x=25,
     padding_y=8,
+    full_width=True,
 ):
     """
     Kiểm tra xem xe có đi vào hoặc chạm vào bounding box của stopline hay không.
@@ -400,6 +409,7 @@ def is_in_stopline_bbox(
         stopline_bbox (tuple): (sx1, sy1, sx2, sy2) bounding box của stopline.
         padding_x (int): Độ mở rộng chiều ngang stopline.
         padding_y (int): Độ mở rộng chiều dọc stopline.
+        full_width (bool): Nếu True (mặc định), dải stopline mở rộng ra toàn bộ các làn xe.
 
     Returns:
         bool: True nếu xe đã đi vào hoặc giao cắt với bounding box của stopline.
@@ -408,7 +418,10 @@ def is_in_stopline_bbox(
         return False
 
     sx1, sy1, sx2, sy2 = map(int, stopline_bbox)
-    sl_x1, sl_x2 = min(sx1, sx2) - padding_x, max(sx1, sx2) + padding_x
+    if full_width:
+        sl_x1, sl_x2 = 0, 99999
+    else:
+        sl_x1, sl_x2 = min(sx1, sx2) - padding_x, max(sx1, sx2) + padding_x
     sl_y1, sl_y2 = min(sy1, sy2) - padding_y, max(sy1, sy2) + padding_y
 
     # 1. Bounding box của xe giao cắt với bounding box stopline
@@ -432,6 +445,7 @@ def check_vehicle_crossed_stopline(
     stopline_bbox,
     padding_x=30,
     padding_y=8,
+    full_width=True,
 ):
     """
     Kiểm tra xem xe có đi qua hoặc chạm vào bounding box của stopline theo hướng tiến vào ROI TOP hay không.
@@ -443,6 +457,7 @@ def check_vehicle_crossed_stopline(
         stopline_bbox (tuple): (sx1, sy1, sx2, sy2) của stopline.
         padding_x (int): Độ mở rộng chiều ngang stopline.
         padding_y (int): Độ mở rộng chiều dọc stopline.
+        full_width (bool): Nếu True (mặc định), dải stopline mở rộng ra toàn bộ các làn xe.
 
     Returns:
         bool: True nếu xe đi qua / giao cắt với stopline theo chiều tiến vào ROI TOP.
@@ -451,7 +466,10 @@ def check_vehicle_crossed_stopline(
         return False
 
     sx1, sy1, sx2, sy2 = map(int, stopline_bbox)
-    sl_x1, sl_x2 = min(sx1, sx2) - padding_x, max(sx1, sx2) + padding_x
+    if full_width:
+        sl_x1, sl_x2 = 0, 99999
+    else:
+        sl_x1, sl_x2 = min(sx1, sx2) - padding_x, max(sx1, sx2) + padding_x
     sl_y1, sl_y2 = min(sy1, sy2) - padding_y, max(sy1, sy2) + padding_y
 
     cx, cy = curr_pos
@@ -480,6 +498,7 @@ def check_vehicle_passed_stopline(
     vehicle_bbox,
     stopline_bbox,
     padding_x=50,
+    full_width=True,
 ):
     """
     Kiểm tra xem xe đã thực sự ĐI QUA bounding box của stopline tiến vào ROI TOP (giao lộ) hay chưa:
@@ -494,6 +513,7 @@ def check_vehicle_passed_stopline(
         vehicle_bbox (tuple): (vx1, vy1, vx2, vy2) của xe.
         stopline_bbox (tuple): (sx1, sy1, sx2, sy2) của stopline.
         padding_x (int): Độ mở rộng chiều ngang của stopline.
+        full_width (bool): Nếu True (mặc định), dải stopline mở rộng ra toàn bộ các làn xe.
 
     Returns:
         bool: True nếu xe đã đi qua vạch dừng tiến vào giao lộ.
@@ -502,7 +522,10 @@ def check_vehicle_passed_stopline(
         return False
 
     sx1, sy1, sx2, sy2 = map(int, stopline_bbox)
-    sl_x1, sl_x2 = min(sx1, sx2) - padding_x, max(sx1, sx2) + padding_x
+    if full_width:
+        sl_x1, sl_x2 = 0, 99999
+    else:
+        sl_x1, sl_x2 = min(sx1, sx2) - padding_x, max(sx1, sx2) + padding_x
     sl_y1 = min(sy1, sy2)  # Mép trên của stopline (hướng về ngã tư / ROI TOP)
     sl_y2 = max(sy1, sy2)  # Mép dưới của stopline (hướng về ROI BOTTOM)
 

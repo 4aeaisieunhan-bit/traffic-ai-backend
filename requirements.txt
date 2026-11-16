@@ -1,0 +1,35 @@
+# Traffic AI — thư viện backend (Python 3.14, đã kiểm tra trên Windows 11 + GPU NVIDIA RTX 4050)
+#
+# CÀI ĐẶT:
+#   1) Tạo môi trường ảo:        python -m venv .venv
+#                                .\.venv\Scripts\Activate.ps1
+#   2) Cài PyTorch TRƯỚC (chọn 1 trong 2 dòng):
+#      - Có GPU NVIDIA (nhanh):  pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu130
+#      - Chỉ có CPU (chậm):      pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cpu
+#   3) Cài phần còn lại:          pip install -r requirements.txt
+#
+# PyTorch KHÔNG nằm trong file này vì bản GPU/CPU phải cài từ kho riêng của PyTorch (bước 2).
+# Ngoài thư viện Python còn cần: Microsoft SQL Server + "ODBC Driver 17/18 for SQL Server" (cho pyodbc).
+
+# ── Web API ──────────────────────────────────────────────
+fastapi==0.162.4
+starlette==1.10.0
+uvicorn==0.54.0
+python-multipart==0.0.33        # nhận file video upload (multipart/form-data)
+pydantic==2.14.3
+python-dotenv==1.2.4            # đọc cấu hình từ .env
+
+# ── Cơ sở dữ liệu ────────────────────────────────────────
+SQLAlchemy==2.1.8
+pyodbc==5.5.0                   # kết nối Microsoft SQL Server
+
+# ── AI / thị giác máy tính ───────────────────────────────
+ultralytics==8.4.182            # YOLO (6 mô hình) + ByteTrack
+lap==0.5.13                     # thuật toán ghép cặp cho ByteTrack (tracking xe)
+opencv-python==5.0.0.93
+numpy==2.5.4
+pillow==13.0.0
+
+# ── Xuất báo cáo ─────────────────────────────────────────
+openpyxl==3.1.5                 # Excel (.xlsx)
+reportlab==4.2.5                # PDF (cần font Unicode: Arial/Segoe UI trên Windows, DejaVu trên Linux)
