@@ -1,11 +1,10 @@
 # tools/helmet_train.py
 # TRAIN TIẾP mô hình helmet từ weights/helmet_26s.pt với dữ liệu đã gán nhãn, rồi tự so sánh cũ / mới.
 #
-#   python tools/helmet_train.py                                   (dùng dữ liệu duyệt trên web + dữ liệu đã sửa)
+#   python tools/helmet_train.py                                   (dùng dữ liệu đã sửa nhãn)
 #   python tools/helmet_train.py --base-data D:/datasets/Mu_Bao_Hiem_QA-1/data.yaml   (NÊN: trộn dữ liệu gốc)
 #
 # Nguồn dữ liệu (định dạng YOLO: <thư mục>/images/*.jpg + <thư mục>/labels/*.txt):
-#   dataset/helmet_feedback   tự sinh khi cán bộ xác nhận / từ chối "Có đội mũ" vi phạm mũ trên web
 #   dataset/helmet_reviewed   ảnh từ tools/helmet_mine.py SAU KHI bạn đã sửa nhãn
 #   --base-data               bộ dữ liệu gốc đã dùng train helmet_26s.pt (trộn vào để mô hình không "quên"
 #                             những gì đã học — chỉ train trên vài trăm ảnh mới dễ làm mô hình kém đi ở ca khác)
@@ -27,9 +26,9 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from utils.helmet_dataset import CLASS_NAMES   # noqa: E402
+from tools.helmet_eval import CLASS_NAMES   # noqa: E402
 
-DEFAULT_SOURCES = [os.path.join(ROOT, "dataset", "helmet_feedback"), os.path.join(ROOT, "dataset", "helmet_reviewed")]
+DEFAULT_SOURCES = [os.path.join(ROOT, "dataset", "helmet_reviewed")]
 
 
 def _group(name: str) -> str:
@@ -65,7 +64,7 @@ def build_dataset(sources: list[str], out: str, base_data: str | None, test_frac
         print(f"  nguồn {src}: đã gộp")
     total = sum(counts.values())
     if total == 0:
-        sys.exit("Chưa có ảnh nào đã gán nhãn. Duyệt vi phạm mũ trên web hoặc chạy tools/helmet_mine.py rồi sửa nhãn trước.")
+        sys.exit("Chưa có ảnh nào đã gán nhãn. Chạy tools/helmet_mine.py rồi sửa nhãn trước.")
     for part in counts:
         os.makedirs(os.path.join(out, part, "images"), exist_ok=True)
 

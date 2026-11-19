@@ -7,6 +7,9 @@ from models.license_plate import model as lp_yolo_model
 from models.vehicle import model as vehicle_yolo_model
 from models.yolo_types import INFER_KW, as_results
 
+# Xe có mép dưới bbox cách đáy khung hình <= số pixel này coi như đang bị cắt (biển số chưa vào khung)
+BOTTOM_EDGE_PX = 3
+
 # ─────────────────────────── MÀU SẮC THEME ───────────────────────────
 # Bảng màu: Nền tối + viền neon
 C_BG_DARK    = (18, 16, 24)       # Nền chính
@@ -87,7 +90,8 @@ class PlateVoteTracker:
     Theo dõi và biểu quyết biển số xe qua nhiều frame theo thuật toán từ nd_bien.py:
     - Lưu trữ lịch sử đọc OCR của từng xe (votes).
     - Biểu quyết chọn chuỗi ký tự xuất hiện nhiều nhất và có độ tin cậy cao nhất.
-    - Duy trì ảnh crop biển số đẹp nhất (best_crop) có diện tích lớn và rõ nét nhất.
+    - Lưu ảnh crop đẹp nhất (lớn, tin cậy cao) THEO TỪNG CHUỖI đọc được -> ảnh trả về luôn là ảnh
+      của đúng chuỗi thắng phiếu (không ghép chữ của lần đọc này với ảnh của lần đọc khác).
     """
 
     def __init__(self):
@@ -97,7 +101,8 @@ class PlateVoteTracker:
         if track_id not in self.tracks:
             self.tracks[track_id] = {
                 "votes": {},
-                "best_crop": None,
+                "crops": {},          # {chuỗi: (crop, conf)} ảnh đẹp nhất của từng chuỗi
+                "best_crop": None,    # ảnh đẹp nhất bất kể chuỗi (chỉ dùng khi chưa có chuỗi hợp lệ)
                 "best_conf": 0.0,
                 "cls_name": cls_name,
                 "last_seen": frame_idx,
@@ -107,15 +112,27 @@ class PlateVoteTracker:
         t["last_seen"] = frame_idx
 
         clean_t = text.strip().upper() if text else ""
-        if len(clean_t.replace("-", "")) >= 2:
+        valid = len(clean_t.replace("-", "")) >= 2
+        if valid:
             t["votes"].setdefault(clean_t, []).append(conf)
 
         if crop is not None and crop.size > 0:
-            area = crop.shape[0] * crop.shape[1]
-            prev_area = t["best_crop"].shape[0] * t["best_crop"].shape[1] if t["best_crop"] is not None else 0
-            if area > prev_area * 1.05 or (area >= prev_area * 0.85 and conf > t["best_conf"]):
+            if self._better(crop, conf, t["best_crop"], t["best_conf"]):
                 t["best_conf"] = conf
                 t["best_crop"] = crop.copy()
+            if valid:
+                prev_crop, prev_conf = t["crops"].get(clean_t, (None, 0.0))
+                if self._better(crop, conf, prev_crop, prev_conf):
+                    t["crops"][clean_t] = (crop.copy(), conf)
+
+    @staticmethod
+    def _better(crop, conf, prev_crop, prev_conf):
+        """Ảnh mới tốt hơn nếu lớn hơn rõ rệt, hoặc gần bằng nhưng tin cậy cao hơn."""
+        if prev_crop is None:
+            return True
+        area = crop.shape[0] * crop.shape[1]
+        prev_area = prev_crop.shape[0] * prev_crop.shape[1]
+        return area > prev_area * 1.05 or (area >= prev_area * 0.85 and conf > prev_conf)
 
     def get_best(self, track_id):
         if track_id not in self.tracks:
@@ -125,14 +142,19 @@ class PlateVoteTracker:
         if not votes:
             return None, t["best_crop"]
 
-        candidates = [k for k in votes.keys() if len(k.replace("-", "")) >= 4]
-        if not candidates:
-            candidates = [k for k in votes.keys() if len(k.replace("-", "")) >= 3]
+        # Ưu tiên chuỗi đủ dài như biển số VN đầy đủ (>= 7 ký tự, VD 29D2-20743, 29A-12345): chuỗi cụt
+        # (đọc được 1 phần, VD "66-905") không được thắng chỉ vì lặp lại vài lần khi đã có chuỗi đầy đủ
+        candidates = []
+        for min_len in (7, 4, 3):
+            candidates = [k for k in votes.keys() if len(k.replace("-", "")) >= min_len]
+            if candidates:
+                break
         if not candidates:
             candidates = list(votes.keys())
 
         best_text = max(candidates, key=lambda k: sum(votes[k]) * (len(k.replace("-", "")) ** 0.5))
-        return best_text, t["best_crop"]
+        crop = t["crops"].get(best_text, (None, 0.0))[0]
+        return best_text, crop if crop is not None else t["best_crop"]
 
 
 class ViolationSidebar:
@@ -176,6 +198,10 @@ class ViolationSidebar:
                 continue
             track_id = int(v_box.id[0])
             vx1, vy1, vx2, vy2 = map(int, v_box.xyxy[0].tolist())
+            if vy2 >= h - BOTTOM_EDGE_PX:
+                # Xe chạm mép dưới khung hình: phần đuôi (biển số) đang bị cắt, thứ "giống biển số" còn
+                # thấy được thường là gương / mũ / lưng người lái -> không đọc, chờ xe vào hẳn khung hình
+                continue
             car_w = vx2 - vx1
             car_h = vy2 - vy1
 
@@ -298,6 +324,22 @@ class ViolationSidebar:
                     )
                     self._update_live_recognized(track_id, cls_name, best_crop, best_text, frame_idx)
 
+    def refresh_violation_plates(self):
+        """
+        Vi phạm được ghi ngay khi kết luận — lúc đó xe có thể còn ở xa / chưa thấy biển số (hay gặp với lỗi
+        không đội mũ: thấy đầu trước khi thấy biển). Mỗi frame, thay biển số của các vi phạm đã ghi bằng kết quả
+        bình chọn mới nhất của xe đó (chữ + ảnh của đúng chuỗi thắng phiếu).
+        Đánh dấu item["plate_updated"] = True để nơi lưu DB cập nhật lại.
+        """
+        for item in self.violations_history:
+            best_text, best_crop = self.vote_tracker.get_best(item["track_id"])
+            if not best_text or best_crop is None or len(best_text.replace("-", "")) < 2:
+                continue
+            if best_text != item["plate_text"] or best_crop is not item["plate_crop"]:
+                item["plate_text"] = best_text
+                item["plate_crop"] = best_crop
+                item["plate_updated"] = True
+
     def _update_live_recognized(self, track_id, cls_name, crop, text, frame_idx):
         existing = next((item for item in self.live_recognized_plates if item["track_id"] == track_id), None)
         if existing:
@@ -355,7 +397,7 @@ class ViolationSidebar:
             plate_crop = self.vehicle_plates[track_id][0]
             plate_text = self.vehicle_plates[track_id][4]
 
-        if plate_crop is None and v_bbox is not None:
+        if plate_crop is None and v_bbox is not None and v_bbox[3] < h - BOTTOM_EDGE_PX:
             bx1, by1, bx2, by2 = v_bbox
             if orig_frame is not None:
                 sub_y1 = max(0, int((by1 + 0.35 * (by2 - by1)) * scale_y))

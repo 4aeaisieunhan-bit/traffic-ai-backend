@@ -13,7 +13,7 @@ from utils.frame_enhance import enhance_plate_crop
 from models.yolo_types import INFER_KW, as_results, to_numpy
 
 # Khởi tạo mô hình OCR nhận diện ký tự biển số xe (từ weights/OCR-26s-best.pt)
-weights_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "weights", "OCR-26s-best.pt")
+weights_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "weights_demo", "kytu.pt")
 ocr_model = YOLO(weights_path)
 
 # Các hằng số cấu hình thuật toán theo tài liệu nd_bien.py

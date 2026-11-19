@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from models.yolo_types import INFER_KW, as_results 
-model = YOLO("weights/light_traffic-26m-best.pt")
+model = YOLO("weights_demo/dengiaothong.pt")
 
 def detect_traffic_light(image) -> list[Results]:
     result = model.predict(

@@ -38,7 +38,7 @@ def classify_reason(reason: Optional[str]) -> str:
     """
     Ánh xạ mô tả vi phạm (chuỗi tự do từ thuật toán quỹ đạo hoặc dữ liệu cũ) -> mã loại vi phạm.
     VD: 'Vi pham: Di thang khi den do' -> RED_LIGHT
-        'Vi pham: Qua stopline va dung yen qua 3.0s khi den do' -> STOP_LINE
+        'Vi pham: Qua stopline va dung yen qua 5.0s khi den do' -> STOP_LINE
     """
     t = fold_text(reason)
     if "mu bao hiem" in t or "helmet" in t:

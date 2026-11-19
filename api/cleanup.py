@@ -36,8 +36,6 @@ def remove_static_file(url_or_path: str | None) -> bool:
 
 def delete_violation(db: Session, v: Violation) -> None:
     """Xoá 1 vi phạm + lịch sử duyệt (cascade) + ảnh bằng chứng / biển số / cận cảnh. Không commit."""
-    from utils.helmet_dataset import remove_sample_files
-    remove_sample_files(v)     # mẫu huấn luyện thô (mẫu đã duyệt trong dataset/ vẫn được giữ)
     for f in (v.evidence_image, v.plate_crop_image, v.subject_crop_image):
         remove_static_file(f)
     db.delete(v)

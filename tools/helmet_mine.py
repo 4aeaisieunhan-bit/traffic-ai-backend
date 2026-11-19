@@ -24,7 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from utils.frame_enhance import enhance_frame          # noqa: E402
-from utils.helmet_dataset import CLASS_NAMES, box_iou       # noqa: E402
+from tools.helmet_eval import CLASS_NAMES, box_iou         # noqa: E402
 
 PROCESS_SIZE = (1280, 720)
 

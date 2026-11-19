@@ -1,9 +1,8 @@
 # utils/helmet_violation.py
 # Phát hiện vi phạm KHÔNG ĐỘI MŨ BẢO HIỂM trên TOÀN KHUNG HÌNH (mọi xe máy đang được tracking).
-# Có thể giới hạn vào 1 vùng bằng tham số `roi` của update() nếu cần (VD: ROI BOTTOM).
 #
 # Quy trình mỗi frame:
-#   1. Lấy các xe máy có track_id (nếu truyền `roi`: chỉ những xe có tâm đáy nằm trong vùng đó).
+#   1. Lấy các xe máy có track_id.
 #   2. Gắn mỗi khung đầu (helmet / no_helmet của mô hình helmet) vào ĐÚNG MỘT xe máy:
 #      tâm khung đầu phải nằm trong "vùng đầu" ở phần trên khung xe (khung xe máy bao cả người lái),
 #      nếu nhiều xe cùng chứa thì chọn xe có mép trên gần nhất.
@@ -20,7 +19,6 @@
 #   c. Kết luận vi phạm cần đủ số frame thấy đầu trần ĐỦ TO (min_decisive_px) — đầu nhỏ chỉ góp phiếu phụ.
 import cv2
 
-from utils.ROI import is_in_roi
 from utils.draw_detections import NO_HELMET_COLOR
 
 REASON = "Vi pham: Khong doi mu bao hiem"   # ASCII: cv2.putText không vẽ được tiếng Việt có dấu
@@ -91,16 +89,15 @@ class HelmetViolationDetector:
         self.violation_count = 0
 
     # ───────────────────────────── CẬP NHẬT ─────────────────────────────
-    def update(self, frame_idx, vehicle_boxes, vehicle_names, helmet_boxes, helmet_names, roi=None):
+    def update(self, frame_idx, vehicle_boxes, vehicle_names, helmet_boxes, helmet_names):
         """
-        roi: None (mặc định) = xét toàn khung hình; hoặc polygon/bbox để chỉ xét xe trong vùng đó.
         Trả về danh sách vi phạm MỚI phát hiện ở frame này:
         [{track_id, cls_name, bbox, head_boxes, frame_idx, reason, confidence}]
         """
         if vehicle_boxes is None or len(vehicle_boxes) == 0:
             return []
 
-        # 1. Xe máy đang được tracking (trong vùng `roi` nếu có)
+        # 1. Xe máy đang được tracking
         motos = []
         for box in vehicle_boxes:
             if box.id is None:
@@ -109,8 +106,7 @@ class HelmetViolationDetector:
             if not _is_motorbike(cls_name):
                 continue
             bbox = tuple(map(int, box.xyxy[0].tolist()))
-            if roi is None or is_in_roi(bbox, roi, method="bottom_center", check_bbox=False):
-                motos.append((int(box.id[0]), bbox, cls_name))
+            motos.append((int(box.id[0]), bbox, cls_name))
         if not motos:
             return []
 

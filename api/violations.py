@@ -18,13 +18,14 @@ from schemas.violation import (
     ViolationTypeResponse, ViolationFilterOptions, violation_to_response,
 )
 
-from utils import helmet_dataset
-
 router = APIRouter(prefix="/api/v1/violations", tags=["Violations"])
 
 ALL_TYPES = {"Tất cả loại vi phạm"}
 ALL_LOCATIONS = {"Tất cả nguồn", "Tất cả vị trí"}
 ALL_STATUSES = {"Tất cả trạng thái"}
+
+# Lý do từ chối có mã (frontend gửi reason_code): người lái có đội mũ, AI nhận nhầm thành "không đội mũ"
+REASON_LABELS = {"has_helmet": "Có đội mũ — mô hình nhận nhầm"}
 
 
 def _today_range():
@@ -165,7 +166,7 @@ def get_violation_detail(violation_id: int, db: Session = Depends(get_db)):
     item = violation_query(db).filter(Violation.id == violation_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Không tìm thấy hồ sơ vi phạm")
-    return _with_training_info(item)
+    return violation_to_response(item)
 
 
 @router.get("/{violation_id}/reviews", response_model=List[ViolationReviewResponse])
@@ -203,15 +204,13 @@ def update_violation_status(
     if not item:
         raise HTTPException(status_code=404, detail="Không tìm thấy hồ sơ vi phạm")
 
-    if payload.reason_code is not None and payload.reason_code not in helmet_dataset.REASON_LABELS:
+    if payload.reason_code is not None and payload.reason_code not in REASON_LABELS:
         raise HTTPException(status_code=400, detail="Mã lý do không hợp lệ")
     if payload.reason_code and payload.status != "Từ chối":
         raise HTTPException(status_code=400, detail="Lý do có mã chỉ dùng khi từ chối hồ sơ")
-    note = payload.note or (helmet_dataset.REASON_LABELS.get(payload.reason_code or "") or None)
+    note = payload.note or (REASON_LABELS.get(payload.reason_code or "") or None)
 
-    label_before = helmet_dataset.dataset_label(item)
-    label_after = helmet_dataset.label_for_review(payload.status, payload.reason_code)
-    if item.status != payload.status or label_before != label_after:
+    if item.status != payload.status:
         db.add(ViolationReview(
             violation_id=item.id, reviewer_id=user.id,
             old_status=item.status, new_status=payload.status, note=note,
@@ -219,17 +218,7 @@ def update_violation_status(
         item.status = payload.status
         db.commit()
         db.refresh(item)
-    # Vi phạm không đội mũ: kết quả duyệt -> nhãn huấn luyện lại mô hình helmet
-    helmet_dataset.apply_review(item, payload.status, payload.reason_code)
-    return _with_training_info(item)
-
-
-def _with_training_info(v: Violation) -> ViolationResponse:
-    resp = violation_to_response(v)
-    if helmet_dataset.is_helmet_violation(v):
-        resp.training_sample = helmet_dataset.has_sample(v)
-        resp.training_label = helmet_dataset.dataset_label(v)
-    return resp
+    return violation_to_response(item)
 
 
 @router.delete("/{violation_id}", status_code=204)

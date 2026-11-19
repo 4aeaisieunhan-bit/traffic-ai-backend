@@ -1,11 +1,12 @@
 # utils/draw_detections.py
-# Vẽ bounding box các đối tượng phụ (đèn tín hiệu, mũ bảo hiểm, biển báo, biển số) và vạch dừng lên frame.
+# Vẽ bounding box các đối tượng phụ (đèn tín hiệu, mũ bảo hiểm) và vạch dừng lên frame.
+# Khung biển số không vẽ (tránh che biển số) — biển số đọc được hiển thị trên sidebar.
 # Dùng chung cho main.py (chạy dòng lệnh) và api/analyze.py (phân tích từ giao diện web)
 # để video đầu ra của hai luồng luôn giống nhau.
 import cv2
 
 # Màu khung mũ bảo hiểm (BGR) — tím / hồng: không trùng với đỏ (vi phạm, đèn đỏ, vạch dừng),
-# xanh lá (xe hợp lệ, đèn xanh), vàng/cam (đang theo dõi, đèn vàng, biển số), xanh dương (biển báo, ROI)
+# xanh lá (xe hợp lệ, đèn xanh), vàng/cam (đang theo dõi, đèn vàng)
 HELMET_COLOR = (247, 85, 168)      # tím  #a855f7 — đội mũ
 NO_HELMET_COLOR = (200, 0, 255)    # hồng #ff00c8 — không đội mũ / vi phạm không đội mũ
 
@@ -46,11 +47,10 @@ def draw_detections(
     frame,
     traffic_light_result,
     helmet_result,
-    traffic_sign_result,
-    license_plate_result,
     recognized_vehicle_boxes,
     active_stopline,
     helmet_violation_boxes=(),
+    stopline_segment=None,
 ):
     """Vẽ lên `frame` (tại chỗ) và trả về chính frame đó.
     helmet_violation_boxes: khung đầu (của chính mô hình helmet) thuộc người đã bị kết luận không đội mũ
@@ -96,36 +96,13 @@ def draw_detections(
         _draw_labeled(frame, hx1 - 2, hy1 - 2, hx2 + 2, hy2 + 2, "VI PHAM: KHONG MU", NO_HELMET_COLOR,
                       font_scale=0.34, pad=4, thickness=2, label_bg=True)
 
-    # 3. Biển báo giao thông
-    res = traffic_sign_result[0]
-    if res.boxes is not None:
-        for box in res.boxes:
-            conf = float(box.conf[0])
-            if conf < 0.25:
-                continue
-            label = res.names[int(box.cls[0])]
-            _draw_labeled(frame, *_box_xyxy(box), f"{label} {conf:.2f}", (255, 128, 0))
-
-    # 4. Biển số: phía trên vạch dừng chỉ vẽ nếu thuộc xe đang được theo dõi
-    res = license_plate_result[0]
-    if res.boxes is not None:
-        for box in res.boxes:
-            conf = float(box.conf[0])
-            if conf < 0.25:
-                continue
-            x1, y1, x2, y2 = _box_xyxy(box)
-            if sl_y_top is not None and y2 < sl_y_top and not _belongs_to_vehicle(
-                (x1 + x2) // 2, (y1 + y2) // 2, recognized_vehicle_boxes, 20
-            ):
-                continue
-            label = res.names[int(box.cls[0])]
-            _draw_labeled(frame, x1, y1, x2, y2, f"{label} {conf:.2f}", (0, 255, 255))
-
-    # 5. Vạch dừng vẽ sau cùng để luôn nằm trên mọi lớp
-    if active_stopline is not None:
-        sx1, sy1, sx2, sy2 = active_stopline
-        cv2.rectangle(frame, (0, sy1 - 1), (width - 1, sy2 + 1), (255, 255, 255), 1)
-        cv2.rectangle(frame, (0, sy1), (width - 1, sy2), (0, 0, 230), 1)
-        cv2.putText(frame, "STOP", (sx1, max(sy1 - 4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 80, 255), 1, cv2.LINE_AA)
+    # 3. Vạch dừng: 1 đường mảnh theo đúng độ nghiêng của vạch, kéo dài hết khung hình
+    #    (đúng ranh giới ROI TOP / BOTTOM mà tracker dùng), vẽ sau cùng để nằm trên mọi lớp
+    if stopline_segment is not None:
+        (ax, ay), (bx, by) = stopline_segment
+        slope = (by - ay) / (bx - ax) if bx != ax else 0.0
+        y_left = int(round(ay + slope * (0 - ax)))
+        y_right = int(round(ay + slope * ((width - 1) - ax)))
+        cv2.line(frame, (0, y_left), (width - 1, y_right), (0, 0, 230), 1, cv2.LINE_AA)
 
     return frame

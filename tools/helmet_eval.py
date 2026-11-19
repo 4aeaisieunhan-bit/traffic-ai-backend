@@ -19,7 +19,16 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from utils.helmet_dataset import CLASS_NAMES, box_iou   # noqa: E402
+CLASS_NAMES = ["helmet", "no_helmet"]          # đúng thứ tự lớp của weights/helmet_26s.pt
+
+
+def box_iou(a, b):
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
 
 THRESH = {"helmet": 0.35, "no_helmet": 0.55}
 

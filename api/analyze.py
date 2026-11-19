@@ -157,6 +157,7 @@ def _execute(db: Session, task: AnalysisTask, video: Video):
     base_time = video.recorded_at or video.uploaded_at
     frame_idx = 0
     new_count = 0
+    saved = []   # [(item sidebar, dòng Violation)] để cập nhật biển số khi xử lý xong
     try:
         while True:
             ret, raw = cap.read()
@@ -168,8 +169,8 @@ def _execute(db: Session, task: AnalysisTask, video: Video):
             # Mỗi vi phạm mới -> lưu ảnh bằng chứng + 1 dòng violations
             for item in result.new_violations:
                 new_count += 1
-                _save_violation(db, task, pipeline, item, result.evidence_frame, frame_idx, fps, base_time, NO_HELMET_COLOR,
-                                clean_frame=result.clean_frame)
+                saved.append((item, _save_violation(db, task, pipeline, item, result.evidence_frame, frame_idx, fps,
+                                                    base_time, NO_HELMET_COLOR)))
                 task.violations_detected = new_count
                 db.commit()
 
@@ -185,6 +186,8 @@ def _execute(db: Session, task: AnalysisTask, video: Video):
     finally:
         cap.release()
         out.release()
+
+    _refresh_saved_plates(pipeline, saved)
 
     for key, st in pipeline.model_stats().items():
         db.add(TaskModelStat(task_id=task.id, model_name=key, weight_file=st["weight"],
@@ -204,7 +207,7 @@ def _execute(db: Session, task: AnalysisTask, video: Video):
 
 
 def _save_violation(db: Session, task: AnalysisTask, pipeline, item: dict, evidence_frame, frame_idx: int,
-                    fps: float, base_time: datetime.datetime, helmet_color, clean_frame=None) -> None:
+                    fps: float, base_time: datetime.datetime, helmet_color) -> Violation:
     """Ghi ảnh bằng chứng / biển số / cận cảnh và thêm 1 dòng violations (chưa commit)."""
     tid = item["track_id"]
     is_helmet = item.get("kind") == "NO_HELMET"
@@ -218,10 +221,6 @@ def _save_violation(db: Session, task: AnalysisTask, pipeline, item: dict, evide
         cv2.rectangle(evidence, (hx1 - 4, hy1 - 4), (hx2 + 4, hy2 + 4), helmet_color, 3)
     if evidence is not None:
         cv2.imwrite(os.path.join(EVIDENCE_DIR, evidence_fname), evidence)
-    if is_helmet and tid in pipeline.helmet_samples:
-        # Mẫu huấn luyện: khi cán bộ duyệt hồ sơ sẽ tự thành dữ liệu gán nhãn (utils/helmet_dataset.py)
-        from utils.helmet_dataset import save_sample
-        save_sample(evidence_fname, clean_frame, **pipeline.helmet_samples[tid])
     plate_fname = None
     if item.get("plate_crop") is not None and item["plate_crop"].size > 0:
         plate_fname = f"plate_{task.id}_{tid}{suffix}.jpg"
@@ -239,7 +238,7 @@ def _save_violation(db: Session, task: AnalysisTask, pipeline, item: dict, evide
     conf_extra = round(nh * 100, 1) if nh is not None else None
     available = [c for c in (conf_vehicle, conf_light, conf_plate, conf_extra) if c is not None]
 
-    db.add(Violation(
+    violation = Violation(
         violation_code=next_violation_code(db),
         task_id=task.id,
         violation_type_id=get_violation_type(db, classify_reason(item.get("reason"))).id,
@@ -260,7 +259,33 @@ def _save_violation(db: Session, task: AnalysisTask, pipeline, item: dict, evide
         evidence_image=f"/static/evidence/{evidence_fname}",
         plate_crop_image=f"/static/evidence/{plate_fname}" if plate_fname else None,
         subject_crop_image=f"/static/evidence/{subject_fname}" if subject_fname else None,
-    ))
+    )
+    db.add(violation)
+    item["plate_updated"] = False   # đã lưu đúng biển số hiện tại
+    return violation
+
+
+def _refresh_saved_plates(pipeline, saved) -> None:
+    """
+    Vi phạm được lưu ngay lúc kết luận, khi xe có thể chưa lộ biển số (VD lỗi không đội mũ kết luận lúc xe còn
+    ở mép khung hình). Sidebar tiếp tục bình chọn biển số -> xử lý xong video thì ghi lại ảnh + chữ biển số mới
+    cho các vi phạm có thay đổi (chưa commit).
+    """
+    for item, violation in saved:
+        if not item.get("plate_updated"):
+            continue
+        crop = item.get("plate_crop")
+        if crop is not None and crop.size > 0:
+            suffix = "_helmet" if item.get("kind") == "NO_HELMET" else ""
+            plate_fname = f"plate_{violation.task_id}_{item['track_id']}{suffix}.jpg"
+            cv2.imwrite(os.path.join(EVIDENCE_DIR, plate_fname), crop)
+            violation.plate_crop_image = f"/static/evidence/{plate_fname}"
+        violation.license_plate = item["plate_text"]
+        violation.confidence_plate = _plate_confidence(pipeline.sidebar, item["track_id"], item["plate_text"])
+        parts = [c for c in (violation.confidence_vehicle, violation.confidence_light, violation.confidence_plate,
+                             violation.confidence_violation) if c is not None]
+        violation.confidence_overall = round(sum(parts) / len(parts), 1) if parts else None
+        item["plate_updated"] = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

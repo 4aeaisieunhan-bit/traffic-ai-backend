@@ -5,7 +5,7 @@ from ultralytics.engine.results import Results
 from models.yolo_types import INFER_KW, as_results
 
 # Đổi mô hình sau khi train lại (tools/helmet_train.py): đặt HELMET_WEIGHTS=weights/<file>.pt trong .env
-HELMET_WEIGHTS = os.getenv("HELMET_WEIGHTS", "weights/helmet_26s.pt")
+HELMET_WEIGHTS = os.getenv("HELMET_WEIGHTS", "weights_demo/mubaohiem.pt")
 model = YOLO(HELMET_WEIGHTS)
 
 

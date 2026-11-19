@@ -40,9 +40,6 @@ class ViolationResponse(BaseModel):
     plate_crop_image: Optional[str] = None
     subject_crop_image: Optional[str] = None   # ảnh cận cảnh người vi phạm (lỗi mũ)
     created_at: datetime.datetime
-    # Dữ liệu huấn luyện lại mô hình helmet (chỉ điền ở API chi tiết / duyệt; utils/helmet_dataset.py)
-    training_sample: bool = False              # vi phạm có mẫu huấn luyện (vi phạm mũ phát hiện từ bản mới)
-    training_label: Optional[str] = None       # nhãn đã ghi vào bộ dữ liệu: 'helmet' | 'no_helmet' | None
 
 
 class ViolationStatusUpdate(BaseModel):

@@ -5,22 +5,13 @@
 import cv2
 import numpy as np
 from collections import defaultdict, deque
-from utils.ROI import (
-    is_point_in_roi,
-    get_roi_bbox,
-    is_in_roi,
-    is_in_stopline_bbox,
-    check_bbox_intersect,
-    check_vehicle_crossed_stopline,
-    check_vehicle_passed_stopline,
-)
+from utils.ROI import horizontal_segment_from_bbox, signed_distance
 
 
 class VehicleStatus:
     APPROACHING = "APPROACHING"           # Xe đang tiếp cận trước vạch dừng
-    OBSERVING = "OBSERVING"               # Đang trong ngưỡng thời gian quan sát quỹ đạo (3s)
+    OBSERVING = "OBSERVING"               # Đang trong ngưỡng thời gian quan sát quỹ đạo (observe_seconds)
     VIOLATION = "VIOLATION"               # Xác nhận vi phạm vượt đèn đỏ
-    STOPLINE_VIOLATION = "VIOLATION"      # Giữ tương thích ngược (trỏ về VIOLATION)
     LEGITIMATE = "LEGITIMATE"             # Xác nhận rẽ hợp lệ theo đèn tín hiệu nhánh
     LEGAL_PASS = "LEGAL_PASS"             # Qua vạch khi đèn xanh thẳng hợp lệ
     IGNORED = "IGNORED"                   # Xe trong ROI TOP không qua stopline (không nhận diện)
@@ -78,22 +69,31 @@ class TrafficViolationTracker:
     def __init__(
         self,
         fps=30.0,
-        observe_seconds=3.0,
+        observe_seconds=5.0,
         turn_threshold_px=25,
         deep_threshold_px=150,
         history_len=90,
-        stopline_still_px=4,
+        line_band_px=6,
+        cross_confirm_frames=3,
+        straight_depth_px=60,
+        right_guard_px=20,
     ):
         """
         Khởi tạo hệ thống theo dõi vi phạm và phân tích quỹ đạo xe.
 
         Args:
             fps (float): Tốc độ khung hình của video.
-            observe_seconds (float): Ngưỡng thời gian quan sát tối đa (mặc định 3.0s).
+            observe_seconds (float): Ngưỡng thời gian quan sát tối đa (mặc định 5.0s).
             turn_threshold_px (int): Độ lệch ngang tối thiểu (pixel) để xác định xe rẽ phải hoặc rẽ trái (25px).
             deep_threshold_px (int): Độ sâu Y tiến vào tim giao lộ (pixel) để xác định xe đi thẳng vượt đèn đỏ (150px).
             history_len (int): Số frame tối đa lưu trữ lịch sử di chuyển của mỗi xe.
-            stopline_still_px (int): Ngưỡng dịch chuyển tối đa (pixel/frame) để xe bị coi là đứng yên (mặc định 4px).
+            line_band_px (int): Tâm đáy xe phải ở phía trên đường vạch dừng quá số pixel này mới tính là ROI TOP.
+            cross_confirm_frames (int): Số frame liên tiếp ở ROI TOP để xác nhận xe đã qua vạch (chống rung bbox).
+            straight_depth_px (int): Độ sâu tối thiểu (pixel) tiến vào giao lộ để kết luận ĐI THẲNG theo quỹ đạo.
+                Đủ sâu để không nhầm với xe rẽ trái (xe rẽ trái cũng tiến thẳng một đoạn trước khi ngoặt).
+            right_guard_px (int): Xe phải lệch sang phải so với hướng LÀN của chính nó (về điểm tụ) ít nhất
+                số pixel này mới được tính là RẼ PHẢI. Chặn nhận nhầm xe làn trái đi thẳng / rẽ trái
+                (trên ảnh các xe này trôi sang phải theo phối cảnh).
         """
         self.fps = max(float(fps), 1.0)
         self.observe_seconds = float(observe_seconds)
@@ -101,7 +101,21 @@ class TrafficViolationTracker:
         self.turn_threshold_px = int(turn_threshold_px)
         self.deep_threshold_px = int(deep_threshold_px)
         self.history_len = int(history_len)
-        self.stopline_still_px = int(stopline_still_px)
+        self.line_band_px = float(line_band_px)
+        self.cross_confirm_frames = max(int(cross_confirm_frames), 1)
+        self.straight_depth_px = float(straight_depth_px)
+        self.right_guard_px = float(right_guard_px)
+        # ByteTrack giữ ID tối đa 30 frame khi mất dấu -> quá ngưỡng này xe coi như đã mất hẳn
+        self.lost_frames = max(31, int(self.fps * 0.6))
+
+        # Điểm tụ phối cảnh (vanishing point) của các LÀN TIẾP CẬN, ước lượng tự động từ quỹ đạo trước vạch
+        # của các xe đã qua vạch (các làn song song ngoài thực tế hội tụ về 1 điểm trên ảnh).
+        # Cho biết hướng làn tại từng vị trí: làn bên trái trôi sang phải trên ảnh, làn bên phải trôi sang trái.
+        # CHỈ dùng để chặn rẽ phải giả — không dùng làm hướng "đi thẳng" vì đường ra phía sau giao lộ
+        # có thể lệch so với các làn tiếp cận.
+        self.approach_paths = defaultdict(lambda: deque(maxlen=150))   # {track_id: deque([(cx, cy), ...])}
+        self.lane_lines = deque(maxlen=60)                              # [(vx, vy, x0, y0), ...]
+        self.vanishing_point = None
 
         # Lịch sử tọa độ tâm đáy xe CHỈ trong vùng ROI TOP (khi đã qua stopline):
         # {track_id: deque([(cx, cy, frame_idx), ...])}
@@ -111,9 +125,6 @@ class TrafficViolationTracker:
         # {track_id: deque([(cx, cy), ...])}
         self.recent_positions = defaultdict(lambda: deque(maxlen=30))
 
-        # Lưu vị trí frame trước của mọi xe để phát hiện thời điểm cắt qua stopline:
-        self.last_positions = {}
-
         # Thông tin trạng thái của từng xe:
         # {track_id: {
         #     'status': VehicleStatus,
@@ -121,10 +132,9 @@ class TrafficViolationTracker:
         #     'start_frame': int,
         #     'start_pos': (cx, cy),
         #     'lights_at_crossing': dict,
-        #     'direction': str,       # 'STRAIGHT', 'RIGHT', 'LEFT'
+        #     'direction': str,       # 'STRAIGHT', 'RIGHT', 'LEFT', 'STRAIGHT_OR_LEFT' (mất dấu)
         #     'reason': str,
         #     'resolved_frame': int,
-        #     'stopline_still_count': int,  # số frame đứng yên liên tục trên stopline
         # }}
         self.vehicles = {}
 
@@ -140,8 +150,8 @@ class TrafficViolationTracker:
     def is_vehicle_recognized(self, track_id):
         """
         Kiểm tra xem xe có đang được nhận diện / hiển thị hay không:
-        - Các phương tiện đi từ làn khác đi vào bounding box của ROI TOP: KHÔNG nhận diện.
-        - CHỈ những xe ở ROI BOTTOM rồi đi vào bounding box của stopline: được nhận diện và theo dõi quỹ đạo.
+        - Các phương tiện đi từ làn khác vào thẳng ROI TOP: KHÔNG nhận diện.
+        - CHỈ những xe từ ROI BOTTOM rồi đi qua vạch dừng: được nhận diện và theo dõi quỹ đạo.
         """
         if track_id not in self.vehicles:
             return False
@@ -159,36 +169,6 @@ class TrafficViolationTracker:
                 recognized.append(box)
         return recognized
 
-    def get_bottom_roi_boxes(self, vehicle_boxes):
-        """
-        Lọc danh sách bounding boxes chỉ giữ lại các xe ĐANG Ở ROI BOTTOM (chưa qua stopline).
-
-        Đây là tập xe gần camera nhất → biển số rõ nhất → dùng để capture ảnh biển tốt nhất
-        lưu vào sidebar trước khi xe đi vào giao lộ và biển trở nên mờ hơn.
-
-        Điều kiện:
-        - Xe được công nhận nhận diện (is_recognized = True)
-        - Xe đã từng ở ROI BOTTOM (was_in_bottom = True)
-        - Xe CHƯA qua stopline (passed_stopline = False) → đang tiếp cận, còn gần camera
-        """
-        if vehicle_boxes is None or len(vehicle_boxes) == 0:
-            return []
-        bottom_boxes = []
-        for box in vehicle_boxes:
-            if box.id is None:
-                continue
-            track_id = int(box.id[0])
-            v_info = self.vehicles.get(track_id)
-            if v_info is None:
-                continue
-            if (
-                v_info.get("is_recognized", False)
-                and v_info.get("was_in_bottom", False)
-                and not v_info.get("passed_stopline", False)
-            ):
-                bottom_boxes.append(box)
-        return bottom_boxes
-
     def update(
         self,
         frame_idx,
@@ -197,24 +177,23 @@ class TrafficViolationTracker:
         traffic_light_boxes,
         light_names,
         stopline_bbox,
-        top_roi=None,
-        bottom_roi=None,
+        stopline_segment=None,
     ):
         """
         Cập nhật vị trí các xe, trạng thái đèn và phân tích quỹ đạo trong frame hiện tại.
         Quy tắc:
-        1. Các phương tiện đi từ làn khác đi vào bounding box của ROI TOP sẽ KHÔNG nhận diện phương tiện đó.
-        2. CHỈ những xe ở ROI BOTTOM rồi đi vào bounding box của stopline thì bắt đầu theo dõi quỹ đạo xe
-           trong ngưỡng thời gian là 3 giây.
+        1. Các phương tiện đi từ làn khác vào thẳng ROI TOP sẽ KHÔNG nhận diện phương tiện đó.
+        2. CHỈ những xe ở ROI BOTTOM rồi đi qua vạch dừng thì bắt đầu theo dõi quỹ đạo xe
+           trong ngưỡng thời gian observe_seconds (mặc định 5 giây).
+
+        Vạch dừng là đoạn thẳng `stopline_segment` ((xa, ya), (xb, yb)); nếu không có thì lấy đường nằm ngang
+        qua tâm `stopline_bbox`. ROI TOP / BOTTOM = hai phía của đường thẳng này (kéo dài hết khung hình).
         """
         light_state = parse_traffic_lights(traffic_light_boxes, light_names)
 
-        # Lấy bounding box của các vùng ROI và Stopline
-        top_roi_bbox = get_roi_bbox(top_roi)
-        bottom_roi_bbox = get_roi_bbox(bottom_roi)
-
-        sl_y1 = min(stopline_bbox[1], stopline_bbox[3]) if stopline_bbox is not None else None
-        sl_y2 = max(stopline_bbox[1], stopline_bbox[3]) if stopline_bbox is not None else None
+        segment = stopline_segment
+        if segment is None and stopline_bbox is not None:
+            segment = horizontal_segment_from_bbox(stopline_bbox)
 
         current_active_ids = set()
 
@@ -234,72 +213,30 @@ class TrafficViolationTracker:
                 cx = (x1 + x2) // 2
                 cy = y2
 
-                # Vị trí frame trước của xe (dùng để kiểm tra cắt qua Stopline)
-                prev_pos = self.last_positions.get(track_id, None)
-                self.last_positions[track_id] = (cx, cy)
-
-                # 1. Xác định xe hiện tại có đang nằm trong ROI TOP (polygon hoặc bounding box) hay không
-                in_top_roi = False
-                if top_roi is not None:
-                    in_top_roi = is_in_roi((x1, y1, x2, y2), top_roi, method="bottom_center")
-                elif sl_y1 is not None:
-                    in_top_roi = (cy < sl_y1)
-
-                if not in_top_roi and top_roi_bbox is not None and sl_y1 is not None:
-                    if check_bbox_intersect((x1, y1, x2, y2), top_roi_bbox) and cy <= sl_y1:
-                        in_top_roi = True
-
-                # 2. Xác định xe hiện tại có đang nằm trong ROI BOTTOM (polygon hoặc bounding box) hay không
-                in_bottom_roi = False
-                if bottom_roi is not None:
-                    in_bottom_roi = is_in_roi((x1, y1, x2, y2), bottom_roi, method="bottom_center")
-                elif sl_y2 is not None:
-                    in_bottom_roi = (cy >= sl_y2)
-
-                if not in_bottom_roi and bottom_roi_bbox is not None and sl_y2 is not None:
-                    if check_bbox_intersect((x1, y1, x2, y2), bottom_roi_bbox) and cy >= sl_y2 - 15:
-                        in_bottom_roi = True
-
-                # 3. Xác định xe có đi vào hoặc chạm bounding box của STOPLINE hay không
-                in_stopline_box = False
-                if stopline_bbox is not None:
-                    in_stopline_box = is_in_stopline_bbox(
-                        vehicle_bbox=(x1, y1, x2, y2),
-                        curr_pos=(cx, cy),
-                        stopline_bbox=stopline_bbox,
-                        padding_x=30,
-                        padding_y=8,
-                        full_width=True,
-                    ) or check_vehicle_crossed_stopline(
-                        prev_pos=prev_pos,
-                        curr_pos=(cx, cy),
-                        vehicle_bbox=(x1, y1, x2, y2),
-                        stopline_bbox=stopline_bbox,
-                        padding_x=30,
-                        padding_y=8,
-                        full_width=True,
-                    )
+                # Xe ở phía nào của vạch dừng: khoảng cách có dấu < 0 là phía giao lộ (ROI TOP)
+                if segment is not None:
+                    in_top_roi = signed_distance((cx, cy), segment) < -self.line_band_px
+                    in_bottom_roi = not in_top_roi
+                else:
+                    in_top_roi = in_bottom_roi = False
 
                 # Khởi tạo trạng thái cho xe mới xuất hiện
                 if track_id not in self.vehicles:
                     if in_bottom_roi:
                         # Xe xuất hiện ở ROI BOTTOM -> Hợp lệ để theo dõi tiếp cận stopline
                         was_in_bottom = True
-                        entered_stopline = False
                         is_recognized = True
                         init_status = VehicleStatus.APPROACHING
                         reason = "Tiếp cận vạch dừng (ROI Bottom)"
                     elif in_top_roi:
-                        # Xe xuất hiện trực tiếp trong bounding box của ROI TOP (đi từ làn khác hoặc rẽ ngang vào):
+                        # Xe xuất hiện trực tiếp trong ROI TOP (đi từ làn khác hoặc rẽ ngang vào):
                         # QUY TẮC: KHÔNG NHẬN DIỆN PHƯƠNG TIỆN ĐÓ!
                         was_in_bottom = False
-                        entered_stopline = False
                         is_recognized = False
                         init_status = VehicleStatus.IGNORED
                         reason = "Xe từ làn khác đi vào ROI TOP (Không nhận diện)"
                     else:
                         was_in_bottom = False
-                        entered_stopline = False
                         is_recognized = False
                         init_status = VehicleStatus.IGNORED
                         reason = "Ngoài vùng giám sát"
@@ -315,10 +252,11 @@ class TrafficViolationTracker:
                         "resolved_frame": None,
                         "bbox": (x1, y1, x2, y2),
                         "was_in_bottom": was_in_bottom,
-                        "entered_stopline": entered_stopline,
                         "passed_stopline": False,
                         "is_recognized": is_recognized,
                         "last_frame": frame_idx,
+                        "top_streak": 0,           # số frame liên tiếp ở phía ROI TOP (chưa xác nhận qua vạch)
+                        "cross_candidate": None,   # (frame, (cx, cy), đèn) tại frame đầu tiên của chuỗi trên
                     }
                 else:
                     self.vehicles[track_id]["bbox"] = (x1, y1, x2, y2)
@@ -333,6 +271,8 @@ class TrafficViolationTracker:
                 # Nếu xe đang trong ROI BOTTOM thì cập nhật was_in_bottom = True
                 if in_bottom_roi:
                     v_info["was_in_bottom"] = True
+                    if not v_info.get("passed_stopline", False):
+                        self.approach_paths[track_id].append((cx, cy))
                     # Cơ chế Dynamic Promotion: nếu trước đó xe bị gán IGNORED (ví dụ mới ló dạng ở góc rìa camera),
                     # nhưng nay đã tiến rõ ràng vào ROI BOTTOM (chưa qua stopline):
                     # Tự động chuyển thành xe hợp lệ để tiếp tục theo dõi
@@ -342,35 +282,40 @@ class TrafficViolationTracker:
                         v_info["reason"] = "Tiếp cận vạch dừng (ROI Bottom)"
 
                 # A. KÍCH HOẠT BẮT ĐẦU THEO DÕI QUỸ ĐẠO:
-                # "chỉ những xe ở ROI BOTTOM rồi đi qua bouding box của stopline thì bắt đầu theo dõi quỹ đạo xe trong ngưỡng thời gian là 3 giây"
+                # "chỉ những xe ở ROI BOTTOM rồi đi qua vạch dừng thì bắt đầu theo dõi quỹ đạo xe trong ngưỡng thời gian là 5 giây"
                 if v_info["was_in_bottom"] and not v_info.get("passed_stopline", False):
-                    has_passed = False
-                    if stopline_bbox is not None:
-                        has_passed = check_vehicle_passed_stopline(
-                            prev_pos=prev_pos,
-                            curr_pos=(cx, cy),
-                            vehicle_bbox=(x1, y1, x2, y2),
-                            stopline_bbox=stopline_bbox,
-                            padding_x=50,
-                            full_width=True,
-                        )
-                    if has_passed:
+                    # Xe chuyển từ phía ROI BOTTOM sang phía ROI TOP và giữ nguyên `cross_confirm_frames`
+                    # frame liên tiếp -> xác nhận đã qua vạch. Mốc thời gian / vị trí / đèn lấy ở frame ĐẦU TIÊN
+                    # sang phía trên, nên độ trễ xác nhận không làm lệch phân tích quỹ đạo.
+                    if in_top_roi:
+                        if v_info.get("cross_candidate") is None:
+                            v_info["cross_candidate"] = (frame_idx, (cx, cy), light_state.copy())
+                        v_info["top_streak"] = v_info.get("top_streak", 0) + 1
+                    else:
+                        v_info["top_streak"] = 0
+                        v_info["cross_candidate"] = None
+
+                    if v_info["top_streak"] >= self.cross_confirm_frames:
+                        cross_frame, cross_pos, cross_lights = v_info["cross_candidate"]
                         # Xe bắt đầu đi hẳn vào giao lộ → reset bộ đếm đứng yên
                         v_info["passed_stopline"] = True
-                        v_info["entered_stopline"] = True
                         v_info["status"] = VehicleStatus.OBSERVING
-                        v_info["start_frame"] = frame_idx  # Mốc bắt đầu tính 3 giây quan sát quỹ đạo
-                        v_info["start_pos"] = (cx, cy)
-                        v_info["lights_at_crossing"] = light_state.copy()
+                        v_info["start_frame"] = cross_frame  # Mốc bắt đầu tính thời gian quan sát quỹ đạo
+                        v_info["start_pos"] = cross_pos
+                        v_info["lights_at_crossing"] = cross_lights
                         v_info["is_recognized"] = True
                         v_info["reason"] = f"Đi qua stopline -> Bắt đầu theo dõi ({self.observe_seconds}s)"
-                        self.trajectories[track_id].append((cx, cy, frame_idx))
+                        self.trajectories[track_id].append((cross_pos[0], cross_pos[1], cross_frame))
+                        self._add_lane_line(track_id, cross_pos[1])
 
                 # B. QUY TẮC NHẬN DIỆN PHƯƠNG TIỆN TRONG ROI TOP:
-                # - Các phương tiện đi từ làn khác đi vào bounding box của ROI TOP sẽ KHÔNG nhận diện.
-                # - CHỈ những xe ở ROI BOTTOM rồi đi qua bounding box của stopline thì mới nhận diện và theo dõi quỹ đạo.
+                # - Các phương tiện đi từ làn khác vào thẳng ROI TOP sẽ KHÔNG nhận diện.
+                # - CHỈ những xe ở ROI BOTTOM rồi đi qua vạch dừng thì mới nhận diện và theo dõi quỹ đạo.
                 if in_top_roi:
-                    if v_info["was_in_bottom"] and v_info.get("passed_stopline", False):
+                    # (cross_candidate != None: xe vừa sang ROI TOP, đang chờ xác nhận qua vạch -> vẫn nhận diện)
+                    if v_info["was_in_bottom"] and (
+                        v_info.get("passed_stopline", False) or v_info.get("cross_candidate") is not None
+                    ):
                         v_info["is_recognized"] = True
                         # Tiếp tục cập nhật quỹ đạo di chuyển trong ROI TOP
                         if v_info["status"] in (VehicleStatus.OBSERVING, VehicleStatus.VIOLATION, VehicleStatus.LEGITIMATE, VehicleStatus.LEGAL_PASS):
@@ -389,56 +334,55 @@ class TrafficViolationTracker:
                     else:
                         v_info["is_recognized"] = False
 
-                # 3. Xử lý xe đang trong thời gian QUAN SÁT QUỸ ĐẠO (3 giây):
-                # Phân định hướng di chuyển thông minh dựa trên độ sâu Y tiến vào giao lộ và tỷ lệ dạt ngang
+                # 3. Xử lý xe đang trong thời gian QUAN SÁT QUỸ ĐẠO (observe_seconds):
+                # Phân định hướng di chuyển dựa trên độ sâu tiến vào giao lộ và độ dạt ngang so với hướng đi thẳng
                 if v_info["status"] == VehicleStatus.OBSERVING and v_info.get("is_recognized", False):
-                    start_frame = v_info["start_frame"]
                     start_x, start_y = v_info["start_pos"]
-                    elapsed_frames = frame_idx - start_frame
+                    elapsed_frames = frame_idx - v_info["start_frame"]
 
                     dx = cx - start_x
-                    dy = cy - start_y
-                    forward_depth = -dy   # Xe di chuyển lên trên (cy < start_y) -> forward_depth dương
+                    forward_depth = start_y - cy   # Xe di chuyển lên trên (cy < start_y) -> forward_depth dương
 
                     # Hướng trục đường tự nhiên theo phối cảnh camera:
                     # Khi tiến lên giao lộ (-dy), làn đường có góc nghiêng phối cảnh dịch sang trái ~ -0.80 * forward_depth.
                     # Độ dạt ngang thực tế so với trục làn đường:
                     lateral_offset = dx + 0.80 * forward_depth
+                    # Độ dạt ngang so với hướng làn tiếp cận của chính xe (None khi chưa ước lượng được điểm tụ)
+                    lane_offset = self._lane_offset(start_x, start_y, dx, forward_depth)
 
                     # 1. Điều kiện phát hiện RẼ PHẢI:
                     # - Xe rẽ phải bắt buộc phải dạt sang bên phải (dx > 15px) và dạt mạnh so với trục đường (lateral_offset >= 40px)
                     # - Hoặc độ dạt sang phải cực lớn (dx >= 45px khi đã nhích được forward_depth >= 15px)
-                    # - TUYỆT ĐỐI không bao giờ nhận diện rẽ phải nếu xe di chuyển lệch sang trái (dx <= 0)
+                    # - VÀ lệch phải so với hướng làn của chính xe (lane_offset >= right_guard_px): xe làn trái đi thẳng
+                    #   hoặc rẽ trái cũng trôi sang phải trên ảnh nhưng KHÔNG lệch khỏi hướng làn của nó
                     is_turn_right = (
                         dx > 15 and forward_depth >= 15 and (lateral_offset >= 40 or dx >= 45)
+                        and (lane_offset is None or lane_offset >= self.right_guard_px)
                     )
 
                     # 2. Điều kiện phát hiện RẼ TRÁI:
-                    # Phải rẽ ngoặt hẳn sang đường cắt ngang bên trái (vượt qua góc nghiêng tự nhiên của trục đường):
                     # - Lệch hẳn sang trái so với trục đường: lateral_offset <= -50px khi forward_depth >= 20px HOẶC
                     # - Xuất phát từ làn rẽ trái cạnh dải phân cách (start_x <= 450) và dạt mạnh sang trái (dx <= -50px)
                     is_turn_left = (forward_depth >= 20 and lateral_offset <= -50) or (
                         start_x <= 450 and dx <= -50 and forward_depth >= 15
                     )
 
-                    # 3. Điều kiện kết luận ĐI THẲNG:
-                    # - Xe bám sát trục đường tiến sâu vào ngã tư (forward_depth >= 30px và |lateral_offset| < 35px)
-                    # - HOẶC xe đã tiến sâu qua ngưỡng deep_threshold_px mà không rẽ
-                    # - HOẶC đã hết thời gian quan sát 3s và đã tiến về phía trước >= 25px
-                    is_straight_track = (forward_depth >= 30 and abs(lateral_offset) < 35)
-                    is_straight_deep = (forward_depth >= self.deep_threshold_px and not is_turn_right and not is_turn_left)
-                    is_straight_timeout = (elapsed_frames >= self.max_observe_frames and forward_depth >= 25 and not is_turn_right and not is_turn_left)
+                    # 3. ĐI THẲNG:
+                    # - Bám sát hướng đi thẳng và đã tiến đủ sâu (straight_depth_px, |lateral_offset| < 35px)
+                    # - HOẶC đã tiến sâu qua ngưỡng deep_threshold_px mà không rẽ
+                    # - HOẶC đã hết thời gian quan sát (observe_seconds) và đã tiến về phía trước >= 25px
+                    not_turning = not is_turn_right and not is_turn_left
+                    is_straight_track = forward_depth >= self.straight_depth_px and abs(lateral_offset) < 35
+                    is_straight_deep = forward_depth >= self.deep_threshold_px and not_turning
+                    is_straight_timeout = elapsed_frames >= self.max_observe_frames and forward_depth >= 25 and not_turning
 
-                    # Kiểm tra thêm: xe qua vạch dừng rồi đứng yên trong giao lộ / trên stopline quá 3s kết hợp đèn đỏ
+                    # Kiểm tra thêm: xe qua vạch dừng rồi đứng yên trong giao lộ / trên stopline quá observe_seconds kết hợp đèn đỏ
                     cross_lights = v_info.get("lights_at_crossing") or light_state
-                    is_current_red = light_state.get("red_light", False) or light_state.get("red_left_arrow", False)
-                    is_red_cross = cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False) or is_current_red
-                    is_still_timeout_on_red = (
-                        elapsed_frames >= self.max_observe_frames
-                        and is_red_cross
-                        and not is_turn_right
-                        and not is_turn_left
+                    is_red_cross = (
+                        cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False)
+                        or light_state.get("red_light", False) or light_state.get("red_left_arrow", False)
                     )
+                    is_still_timeout_on_red = elapsed_frames >= self.max_observe_frames and is_red_cross and not_turning
 
                     direction = None
                     if is_turn_right:
@@ -449,69 +393,155 @@ class TrafficViolationTracker:
                         direction = "STRAIGHT"
 
                     if direction is not None:
-                        v_info["direction"] = direction
-                        v_info["resolved_frame"] = frame_idx
+                        stood_still = is_still_timeout_on_red and forward_depth < 25
+                        self._resolve(track_id, v_info, direction, light_state, frame_idx, stood_still=stood_still)
 
-                        cross_lights = v_info["lights_at_crossing"] or light_state
-
-                        # Đối chiếu hướng di chuyển với tín hiệu đèn tại thời điểm vượt vạch:
-                        if direction == "RIGHT":
-                            # Xe rẽ phải
-                            if (
-                                cross_lights.get("green_right_arrow", False)
-                                or light_state.get("green_right_arrow", False)
-                                or cross_lights.get("green_light", False)
-                            ):
-                                v_info["status"] = VehicleStatus.LEGITIMATE
-                                v_info["reason"] = "Re phai hop le (co den re phai)"
-                                if track_id not in self.legitimate_ids:
-                                    self.legitimate_ids.add(track_id)
-                                    self.legitimate_turn_count += 1
-                                    self.legitimate_right_count += 1
-                            else:
-                                v_info["status"] = VehicleStatus.VIOLATION
-                                v_info["reason"] = "Vi pham: Re phai khi den do"
-                                if track_id not in self.violation_ids:
-                                    self.violation_ids.add(track_id)
-                                    self.violation_count += 1
-
-                        elif direction == "STRAIGHT":
-                            # Xe đi thẳng hoặc đứng yên trong giao lộ/stopline khi đèn đỏ
-                            if cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False) or is_current_red:
-                                v_info["status"] = VehicleStatus.VIOLATION
-                                if is_still_timeout_on_red and forward_depth < 25:
-                                    v_info["reason"] = f"Vi pham: Qua stopline va dung yen qua {self.observe_seconds:.1f}s khi den do"
-                                else:
-                                    v_info["reason"] = "Vi pham: Di thang khi den do"
-                                if track_id not in self.violation_ids:
-                                    self.violation_ids.add(track_id)
-                                    self.violation_count += 1
-                            else:
-                                v_info["status"] = VehicleStatus.LEGAL_PASS
-                                v_info["reason"] = "Di thang hop le (den xanh)"
-                                self.straight_legal_count += 1
-
-                        elif direction == "LEFT":
-                            # Xe rẽ trái
-                            if (
-                                cross_lights.get("green_left_arrow", False)
-                                or light_state.get("green_left_arrow", False)
-                                or cross_lights.get("green_light", False)
-                            ):
-                                v_info["status"] = VehicleStatus.LEGITIMATE
-                                v_info["reason"] = "Re trai hop le (co den re trai)"
-                                if track_id not in self.legitimate_ids:
-                                    self.legitimate_ids.add(track_id)
-                                    self.legitimate_turn_count += 1
-                                    self.legitimate_left_count += 1
-                            else:
-                                v_info["status"] = VehicleStatus.VIOLATION
-                                v_info["reason"] = "Vi pham: Re trai khi den do"
-                                if track_id not in self.violation_ids:
-                                    self.violation_ids.add(track_id)
-                                    self.violation_count += 1
+        # 4. Xe đang QUAN SÁT nhưng bị mất dấu (YOLO không còn phát hiện được, VD bị xe khác che khi đang rẽ):
+        # kết luận theo phần quỹ đạo đã thấy thay vì để kẹt ở OBSERVING mãi mãi.
+        for track_id, v_info in self.vehicles.items():
+            if (
+                v_info["status"] != VehicleStatus.OBSERVING
+                or v_info.get("lost")
+                or track_id in current_active_ids
+                or frame_idx - v_info["last_frame"] < self.lost_frames
+            ):
+                continue
+            v_info["lost"] = True
+            traj = self.trajectories.get(track_id)
+            if not traj:
+                continue
+            start_x, start_y = v_info["start_pos"]
+            last_x, last_y, _ = traj[-1]
+            dx = last_x - start_x
+            forward_depth = start_y - last_y
+            if forward_depth < 15:
+                v_info["reason"] = "Mat dau truoc khi du du lieu quy dao"
+                continue
+            lane_offset = self._lane_offset(start_x, start_y, dx, forward_depth)
+            if lane_offset is not None:
+                is_right = dx > 15 and lane_offset >= self.right_guard_px
+            else:
+                is_right = dx > 15 and dx + 0.80 * forward_depth >= 40
+            if is_right:
+                # Rẽ phải lệch sang phải rất sớm và rõ -> đủ tin cậy dù quỹ đạo ngắn
+                self._resolve(track_id, v_info, "RIGHT", light_state, frame_idx, note=" (mat dau)")
+                continue
+            # Đoạn đầu của xe rẽ trái trông giống hệt xe đi thẳng (cùng tiến thẳng vào giao lộ trước khi ngoặt)
+            # -> không đoán hướng. Chỉ kết luận khi đi thẳng và rẽ trái cho CÙNG kết quả theo đèn.
+            cross_lights = v_info["lights_at_crossing"] or light_state
+            straight_ok = not (cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False))
+            left_ok = cross_lights.get("green_left_arrow", False) or cross_lights.get("green_light", False)
+            if straight_ok == left_ok:
+                self._resolve(track_id, v_info, "STRAIGHT_OR_LEFT", light_state, frame_idx, note=" (mat dau)")
+            else:
+                v_info["reason"] = "Mat dau: chua phan biet duoc di thang / re trai"
 
         return light_state
+
+    # ───────────────────────────── Phối cảnh: điểm tụ của các làn ─────────────────────────────
+
+    def _add_lane_line(self, track_id, stopline_y):
+        """Fit đường thẳng qua quỹ đạo tiếp cận của xe vừa qua vạch rồi cập nhật lại điểm tụ."""
+        path = self.approach_paths.pop(track_id, None)
+        if not path or len(path) < 15:
+            return
+        pts = np.asarray(path, dtype=np.float32)
+        if float(np.ptp(pts[:, 1])) < 60:          # quãng tiếp cận quá ngắn -> hướng không tin cậy
+            return
+        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        if abs(vy) < 1e-6 or abs(vx / vy) > 1.5:    # làn tiếp cận phải gần dọc ảnh (bỏ xe chuyển làn ngang)
+            return
+        self.lane_lines.append((float(vx), float(vy), float(x0), float(y0)))
+        self._update_vanishing_point(stopline_y)
+
+    def _update_vanishing_point(self, stopline_y):
+        """Giao điểm bình phương tối thiểu của các làn; loại làn lệch nhiều (xe chuyển làn) rồi tính lại."""
+        lines = np.asarray(self.lane_lines, dtype=np.float64)
+        if len(lines) < 3:
+            return
+        normals = np.column_stack([-lines[:, 1], lines[:, 0]])          # pháp tuyến đơn vị của từng làn
+        offsets = np.einsum("ij,ij->i", normals, lines[:, 2:4])
+        keep = np.ones(len(lines), dtype=bool)
+        vp = None
+        for _ in range(2):
+            if keep.sum() < 3:
+                return
+            vp = np.linalg.lstsq(normals[keep], offsets[keep], rcond=None)[0]
+            residual = np.abs(normals @ vp - offsets)                     # khoảng cách từ điểm tụ tới từng làn
+            keep = residual <= max(40.0, float(np.median(residual)) * 3)
+        # Điểm tụ phải nằm phía trên vạch dừng (phía xa camera)
+        if vp is not None and vp[1] < stopline_y - 50:
+            self.vanishing_point = (float(vp[0]), float(vp[1]))
+
+    def _lane_offset(self, start_x, start_y, dx, forward_depth):
+        """
+        Độ dạt ngang (pixel, dương = sang phải) so với hướng làn tiếp cận tại điểm qua vạch (start_x, start_y),
+        tức hướng về điểm tụ. None nếu chưa ước lượng được điểm tụ.
+        """
+        if self.vanishing_point is None:
+            return None
+        vp_x, vp_y = self.vanishing_point
+        if start_y - vp_y < 20:
+            return None
+        return dx - (vp_x - start_x) / (start_y - vp_y) * forward_depth
+
+    # ───────────────────────────── Kết luận hướng đi + đối chiếu đèn ─────────────────────────────
+
+    def _resolve(self, track_id, v_info, direction, light_state, frame_idx, stood_still=False, note=""):
+        """Gán hướng đi đã xác định cho xe và đối chiếu với tín hiệu đèn tại thời điểm vượt vạch."""
+        v_info["direction"] = direction
+        v_info["resolved_frame"] = frame_idx
+        cross_lights = v_info["lights_at_crossing"] or light_state
+
+        if direction == "STRAIGHT_OR_LEFT":
+            # Chỉ gọi khi đi thẳng và rẽ trái cùng kết quả theo đèn tại thời điểm vượt vạch
+            if cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False):
+                self._mark_violation(track_id, v_info, "Vi pham: Di thang / re trai khi den do" + note)
+            else:
+                v_info["status"] = VehicleStatus.LEGAL_PASS
+                v_info["reason"] = "Di thang / re trai hop le (den xanh)" + note
+                self.straight_legal_count += 1
+            return
+
+        if direction == "STRAIGHT":
+            is_red = (
+                cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False)
+                or light_state.get("red_light", False) or light_state.get("red_left_arrow", False)
+            )
+            if is_red:
+                if stood_still:
+                    reason = f"Vi pham: Qua stopline va dung yen qua {self.observe_seconds:.1f}s khi den do"
+                else:
+                    reason = "Vi pham: Di thang khi den do"
+                self._mark_violation(track_id, v_info, reason + note)
+            else:
+                v_info["status"] = VehicleStatus.LEGAL_PASS
+                v_info["reason"] = "Di thang hop le (den xanh)" + note
+                self.straight_legal_count += 1
+            return
+
+        arrow = "green_right_arrow" if direction == "RIGHT" else "green_left_arrow"
+        side = "phai" if direction == "RIGHT" else "trai"
+        allowed = cross_lights.get(arrow, False) or light_state.get(arrow, False) or cross_lights.get("green_light", False)
+        if allowed:
+            v_info["status"] = VehicleStatus.LEGITIMATE
+            v_info["reason"] = f"Re {side} hop le (co den re {side})" + note
+            if track_id not in self.legitimate_ids:
+                self.legitimate_ids.add(track_id)
+                self.legitimate_turn_count += 1
+                if direction == "RIGHT":
+                    self.legitimate_right_count += 1
+                else:
+                    self.legitimate_left_count += 1
+        else:
+            self._mark_violation(track_id, v_info, f"Vi pham: Re {side} khi den do" + note)
+
+    def _mark_violation(self, track_id, v_info, reason):
+        v_info["status"] = VehicleStatus.VIOLATION
+        v_info["reason"] = reason
+        if track_id not in self.violation_ids:
+            self.violation_ids.add(track_id)
+            self.violation_count += 1
 
     def draw_visuals(self, frame, frame_idx, extra_lines=None):
         """extra_lines: [(text, bgr_color)] thêm vào cuối bảng HUD (VD: số xe không đội mũ bảo hiểm)."""
@@ -572,7 +602,8 @@ class TrafficViolationTracker:
 
             direction = info.get("direction", "UNKNOWN")
             # Map direction sang nhãn tiếng Việt
-            dir_label = {"RIGHT": "Re phai", "LEFT": "Re trai", "STRAIGHT": "Di thang"}.get(direction, "")
+            dir_label = {"RIGHT": "Re phai", "LEFT": "Re trai", "STRAIGHT": "Di thang",
+                         "STRAIGHT_OR_LEFT": "Thang/Re trai"}.get(direction, "")
 
             if status == VehicleStatus.VIOLATION:
                 box_color = (0, 0, 255)
