@@ -2,7 +2,6 @@
 # Trạng thái hệ thống thật (thay cho số liệu giả trên giao diện):
 #   - GET /api/v1/system/status         : thiết bị AI (GPU/CPU), mô hình, đang rảnh/đang phân tích, tốc độ xử lý gần nhất
 #   - GET /api/v1/system/notifications  : thông báo sinh từ vi phạm mới + lần phân tích hoàn tất / thất bại
-#   - GET /api/v1/public/stats          : số liệu tổng hợp cho trang chủ (KHÔNG cần đăng nhập, chỉ số đếm)
 import datetime
 import os
 import threading
@@ -13,13 +12,9 @@ from sqlalchemy.orm import Session, joinedload
 
 from api.deps import get_current_user
 from database.connection import engine, get_db
-from database.models import AnalysisTask, Location, Video, Violation
+from database.models import AnalysisTask, Violation
 
 router = APIRouter(prefix="/api/v1/system", tags=["System"], dependencies=[Depends(get_current_user)])
-public_router = APIRouter(prefix="/api/v1/public", tags=["Public"])
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
 
 _device_lock = threading.Lock()
 _device_cache: dict | None = None
@@ -39,10 +34,13 @@ def _ai_device() -> dict:
 
 
 def _model_files() -> list[dict]:
-    from api.analyze import MODEL_INFO   # danh sách mô hình dùng cho pipeline phân tích
+    """Các file trọng số mà pipeline thực sự nạp (5 mô hình phát hiện + OCR ký tự biển số)."""
+    from models.weights import weight_label
+    from utils.pipeline import MODEL_INFO, OCR_INFO
+    entries = list(MODEL_INFO.items()) + [("OCR", OCR_INFO)]
     return [
-        {"key": key, "name": name, "weight": weight, "available": os.path.isfile(os.path.join(WEIGHTS_DIR, weight))}
-        for key, (name, weight, _module) in MODEL_INFO.items()
+        {"key": key, "name": name, "weight": weight_label(path), "available": os.path.isfile(path)}
+        for key, (name, path, _module) in entries
     ]
 
 
@@ -114,16 +112,3 @@ def notifications(limit: int = Query(20, ge=1, le=50), db: Session = Depends(get
     items.sort(key=lambda x: x["time"], reverse=True)
     return {"items": items[:limit]}
 
-
-@public_router.get("/stats")
-def public_stats(db: Session = Depends(get_db)):
-    """Số liệu tổng hợp hiển thị trên trang chủ (chỉ số đếm, không có dữ liệu cá nhân / biển số)."""
-    avg_conf = db.query(func.avg(Violation.confidence_overall)).filter(Violation.confidence_overall.isnot(None)).scalar()
-    return {
-        "locations": db.query(func.count(Location.id)).scalar() or 0,
-        "videos_analyzed": db.query(func.count(AnalysisTask.id)).filter(AnalysisTask.status == "completed").scalar() or 0,
-        "vehicles_scanned": int(db.query(func.coalesce(func.sum(AnalysisTask.vehicles_scanned), 0)).scalar() or 0),
-        "violations": db.query(func.count(Violation.id)).scalar() or 0,
-        "avg_confidence": round(float(avg_conf), 1) if avg_conf is not None else None,
-        "videos_uploaded": db.query(func.count(Video.id)).scalar() or 0,
-    }

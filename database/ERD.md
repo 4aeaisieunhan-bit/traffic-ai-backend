@@ -66,7 +66,7 @@ erDiagram
     ANALYSIS_TASKS {
         varchar id PK "task_id 8 ký tự"
         int video_id FK
-        varchar status "pending | processing | completed | failed"
+        varchar status "pending | processing | completed | failed | cancelled"
         float progress
         int current_frame
         int total_frames
@@ -137,7 +137,7 @@ erDiagram
 | `users` – `videos` | 1 – n | Một cán bộ upload nhiều video |
 | `locations` – `videos` | 1 – n | Nhiều video quay tại cùng một địa điểm |
 | `videos` – `analysis_tasks` | 1 – n | Một video có thể phân tích nhiều lần (ví dụ khi đổi tham số hoặc mô hình) |
-| `analysis_tasks` – `task_model_stats` | 1 – n | Mỗi lần phân tích lưu số liệu của 6 mô hình AI |
+| `analysis_tasks` – `task_model_stats` | 1 – n | Mỗi lần phân tích lưu số liệu của 5 mô hình phát hiện (phương tiện, đèn, mũ, biển số, vạch dừng); mô hình OCR ký tự chạy trên ảnh biển số nên không có dòng riêng |
 | `analysis_tasks` – `violations` | 1 – n | Mỗi lần phân tích phát hiện nhiều vi phạm |
 | `violation_types` – `violations` | 1 – n | Danh mục chuẩn hóa loại vi phạm |
 | `violations` – `violation_reviews` | 1 – n | Mỗi lần đổi trạng thái hồ sơ được ghi lại |
@@ -149,6 +149,8 @@ erDiagram
 - **Thời điểm vi phạm:** `occurred_at = videos.recorded_at + video_time_sec`. Nếu không biết thời điểm quay thì dùng `uploaded_at`.
 - **Độ tin cậy NULL được:** cột để NULL khi mô hình không cung cấp điểm, thay vì điền số giả.
 - **Toàn vẹn dữ liệu:** `status` và `role` có ràng buộc `CHECK`, các khóa ngoại đều được khai báo.
+- **Không giữ kết quả dở dang:** lần phân tích bị huỷ, thất bại hoặc bị gián đoạn do tắt server thì vi phạm, ảnh và video kết quả của lần đó bị xoá; chỉ giữ bản ghi `analysis_tasks` cùng `error_message`.
+- **Tài khoản tự đăng ký** được tạo với `is_active = 0`, quản trị viên kích hoạt rồi mới đăng nhập được.
 - **Không mất dữ liệu cũ:** bảng cấu trúc cũ được đổi tên thành `*_legacy`. `server.py` chuyển dữ liệu sang bảng mới khi khởi động.
 
 ## Vẽ ERD

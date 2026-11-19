@@ -3,7 +3,6 @@
 import hashlib
 import hmac
 import os
-import unicodedata
 from typing import Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
@@ -11,59 +10,15 @@ from sqlalchemy.orm import Session, joinedload
 from database.models import (
     AnalysisTask, User, Video, Violation, ViolationType,
 )
+from utils.labels import VIOLATION_TYPES, classify_reason, fold_text, vehicle_label  # noqa: F401  (dùng lại ở module khác)
 
-# ── Danh mục loại vi phạm ────────────────────────────────────────────────────
-VIOLATION_TYPE_SEED = [
-    ("RED_LIGHT", "Vượt đèn đỏ", "Đi thẳng / rẽ trái / rẽ phải khi đèn đỏ"),
-    ("STOP_LINE", "Không dừng đúng vạch khi đèn đỏ", "Vượt qua vạch dừng và dừng lại trong giao lộ khi đèn đỏ"),
-    ("NO_HELMET", "Không đội mũ bảo hiểm", "Người điều khiển / ngồi sau xe máy không đội mũ bảo hiểm"),
-]
-
-DEFAULT_ADMIN = {
-    "email": "admin@gmail.com",
-    "password": "123456",   # Trùng tài khoản demo ở Frontend; nên đổi khi triển khai thật
-    "full_name": "Admin",
-    "role": "admin",
-}
-
-
-def fold_text(text: Optional[str]) -> str:
-    """Bỏ dấu tiếng Việt + chữ thường: 'Vượt đèn đỏ' -> 'vuot den do'."""
-    text = (text or "").replace("đ", "d").replace("Đ", "D")
-    text = unicodedata.normalize("NFD", text)
-    return "".join(c for c in text if unicodedata.category(c) != "Mn").lower()
-
-
-def classify_reason(reason: Optional[str]) -> str:
-    """
-    Ánh xạ mô tả vi phạm (chuỗi tự do từ thuật toán quỹ đạo hoặc dữ liệu cũ) -> mã loại vi phạm.
-    VD: 'Vi pham: Di thang khi den do' -> RED_LIGHT
-        'Vi pham: Qua stopline va dung yen qua 5.0s khi den do' -> STOP_LINE
-    """
-    t = fold_text(reason)
-    if "mu bao hiem" in t or "helmet" in t:
-        return "NO_HELMET"
-    if "dung yen" in t or "stopline" in t or "vach" in t:
-        return "STOP_LINE"
-    return "RED_LIGHT"
+# ── Danh mục loại vi phạm (khai báo ở utils/labels.py) ───────────────────────
+VIOLATION_TYPE_SEED = [(code, name, desc) for code, (name, desc) in VIOLATION_TYPES.items()]
 
 
 def normalize_vehicle_type(raw: Optional[str]) -> Optional[str]:
     """Chuẩn hóa tên class YOLO / dữ liệu cũ: 'XE MAY', 'motorcycle' -> 'Xe máy'."""
-    if not raw:
-        return None
-    t = fold_text(raw)
-    if t in ("xe", "unknown"):
-        return None
-    if "may" in t or "motor" in t:
-        return "Xe máy"
-    if "bus" in t or "khach" in t or "16 cho" in t:
-        return "Xe khách"
-    if "truck" in t or "tai" in t:
-        return "Xe tải"
-    if "o to" in t or "oto" in t or "car" in t or "sedan" in t:
-        return "Ô tô"
-    return raw.strip()
+    return vehicle_label(raw)
 
 
 def get_violation_type(db: Session, code: str) -> ViolationType:
@@ -89,8 +44,21 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-def get_default_admin(db: Session) -> Optional[User]:
-    return db.query(User).filter(User.email == DEFAULT_ADMIN["email"]).first()
+# ── Tài khoản ───────────────────────────────────────────────────────────────
+# Tài khoản quản trị đầu tiên: chỉ tạo khi hệ thống CHƯA có quản trị viên nào.
+#   ADMIN_EMAIL / ADMIN_PASSWORD trong .env; không đặt ADMIN_PASSWORD -> sinh mật khẩu ngẫu nhiên, in 1 lần ra console.
+ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "admin@gmail.com").strip().lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or ""
+# Mật khẩu mặc định của các phiên bản cũ: còn dùng thì cảnh báo khi khởi động
+LEGACY_DEFAULT_PASSWORD = "123456"
+
+# Tài khoản tự đăng ký phải được quản trị viên kích hoạt mới đăng nhập được.
+# AUTO_APPROVE_REGISTRATION=1: kích hoạt ngay (chỉ nên dùng khi chạy demo trên máy cá nhân).
+AUTO_APPROVE_REGISTRATION = os.getenv("AUTO_APPROVE_REGISTRATION", "0").strip().lower() in ("1", "true", "yes")
+
+
+def has_active_admin(db: Session) -> bool:
+    return db.query(User.id).filter(User.role == "admin", User.is_active.is_(True)).first() is not None
 
 
 # ── Truy vấn ────────────────────────────────────────────────────────────────

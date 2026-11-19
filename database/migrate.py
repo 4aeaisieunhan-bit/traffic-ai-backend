@@ -274,9 +274,12 @@ def migrate_legacy_rows(engine: Engine, db: Session) -> int:
 
 
 def mark_interrupted_tasks(db: Session) -> None:
-    """Task đang pending/processing lúc server tắt sẽ không bao giờ chạy tiếp -> đánh dấu failed."""
+    """Task đang pending/processing lúc server tắt sẽ không bao giờ chạy tiếp -> bỏ kết quả dở dang, đánh dấu failed."""
+    from api.cleanup import delete_task_results
+
     stale = db.query(AnalysisTask).filter(AnalysisTask.status.in_(["pending", "processing"])).all()
     for t in stale:
+        delete_task_results(db, t)
         t.status = "failed"
         t.error_message = "Server đã khởi động lại khi tác vụ đang chạy, vui lòng phân tích lại"
         t.finished_at = datetime.datetime.now()

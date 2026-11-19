@@ -10,11 +10,11 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from utils.frame_enhance import enhance_plate_crop
+from models.weights import OCR_WEIGHTS
 from models.yolo_types import INFER_KW, as_results, to_numpy
 
-# Khởi tạo mô hình OCR nhận diện ký tự biển số xe (từ weights/OCR-26s-best.pt)
-weights_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "weights_demo", "kytu.pt")
-ocr_model = YOLO(weights_path)
+# Khởi tạo mô hình OCR nhận diện ký tự biển số xe
+ocr_model = YOLO(OCR_WEIGHTS)
 
 # Các hằng số cấu hình thuật toán theo tài liệu nd_bien.py
 OCR_MIN_CROP_WIDTH = 140      # Chiều rộng tối thiểu để phóng to ảnh biển số trước khi OCR
@@ -99,11 +99,3 @@ def read_plate_details(plate_img, conf_thresh=0.10, iou_thresh=0.45):
 
     mean_score = float(np.mean(scores))
     return text, mean_score, crop_in
-
-
-def recognize_plate_text(plate_img, conf_thresh=0.10):
-    """
-    Hàm wrapper tương thích ngược: trả về chuỗi văn bản biển số nhận diện được.
-    """
-    text, _, _ = read_plate_details(plate_img, conf_thresh=conf_thresh)
-    return text or ""

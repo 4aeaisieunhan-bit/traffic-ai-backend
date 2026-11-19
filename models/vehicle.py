@@ -1,7 +1,8 @@
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
+from models.weights import VEHICLE_WEIGHTS
 from models.yolo_types import INFER_KW, as_results 
-model = YOLO("weights_demo/phuongtienmoi.pt")
+model = YOLO(VEHICLE_WEIGHTS)
 def detect_vehicle(image, track=True) -> list[Results]:
     if track:
         result = model.track(

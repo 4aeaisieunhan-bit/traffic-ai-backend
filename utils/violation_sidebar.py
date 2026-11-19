@@ -4,11 +4,12 @@
 # nền tối trung tính, 3 cấp chữ, 1 màu đỏ tín hiệu cho vi phạm, chữ tiếng Việt có dấu (IBM Plex, vẽ bằng Pillow).
 import cv2
 import numpy as np
-from models.ocr import read_plate_details, recognize_plate_text
+from models.ocr import read_plate_details
 from models.license_plate import model as lp_yolo_model
 from models.vehicle import model as vehicle_yolo_model
 from models.yolo_types import INFER_KW, as_results
-from utils.text_render import TextLayer as _TextLayer
+from utils.labels import vehicle_label
+from utils.text_render import TextLayer
 
 # Xe có mép dưới bbox cách đáy khung hình <= số pixel này coi như đang bị cắt (biển số chưa vào khung)
 BOTTOM_EDGE_PX = 3
@@ -47,22 +48,8 @@ def _reason_vi(reason):
 
 
 def _vehicle_vi(cls_name):
-    t = (cls_name or "").lower()
-    if "motor" in t or "xe may" in t:
-        return "Xe máy"
-    if "bicycle" in t or "xe dap" in t:
-        return "Xe đạp"
-    if "bus" in t or "buyt" in t:
-        return "Xe buýt"
-    if "container" in t:
-        return "Xe container"
-    if "fire" in t or "cuu hoa" in t:
-        return "Xe cứu hỏa"
-    if "truck" in t or "tai" in t:
-        return "Xe tải"
-    if "car" in t or "hoi" in t or "o to" in t or "van" in t:
-        return "Ô tô"
-    return (cls_name or "Xe").capitalize()
+    """Tên loại xe trên thanh bên — cùng bảng nhãn với database / báo cáo (utils/labels.py)."""
+    return vehicle_label(cls_name) or "Xe"
 
 
 # ─────────────────────────── HÀM VẼ ẢNH / KHUNG ───────────────────────────
@@ -514,7 +501,7 @@ class ViolationSidebar:
         canvas[:, sx:ex] = C_BG
         cv2.line(canvas, (sx, 0), (sx, h), C_LINE, 1)
 
-        self._text = _TextLayer()
+        self._text = TextLayer()
         num_violations = len(self.violations_history)
         num_scanned = len(self.vehicle_plates)
 

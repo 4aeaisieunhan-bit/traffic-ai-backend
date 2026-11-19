@@ -95,7 +95,3 @@ class TextLayer:
         canvas[:, x0:x1] = np.asarray(img)
         self.items.clear()
 
-
-
-
-_TextLayer = TextLayer   # tên cũ

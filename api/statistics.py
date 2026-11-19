@@ -72,7 +72,7 @@ def get_statistics_summary(db: Session = Depends(get_db)):
 
     return {
         "totalViolations": total,
-        "todayViolations": sum(1 for v in violations if v.created_at.date() == today),
+        "todayViolations": sum(1 for v in violations if v.occurred_at.date() == today),
         "confirmedViolations": sum(1 for v in violations if v.status == "Đã xác nhận"),
         "pendingApproval": sum(1 for v in violations if v.status == "Chưa xử lý"),
         "rejectedViolations": sum(1 for v in violations if v.status == "Từ chối"),

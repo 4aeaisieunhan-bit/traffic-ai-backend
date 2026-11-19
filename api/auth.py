@@ -10,7 +10,7 @@ from api.deps import (
     MEDIA_COOKIE, create_session, get_current_session, get_current_user, login_limiter,
 )
 from database.connection import get_db
-from database.lookups import hash_password, verify_password
+from database.lookups import AUTO_APPROVE_REGISTRATION, hash_password, verify_password
 from database.models import User, UserSession
 from schemas.auth import (
     ChangePasswordRequest, LoginRequest, LoginResponse, RegisterRequest, UserResponse,
@@ -25,7 +25,9 @@ _LOGIN_FAILED = "Email hoặc mật khẩu không đúng"
 
 
 def _user_response(u: User) -> UserResponse:
-    return UserResponse(id=u.id, email=u.email, full_name=u.full_name, role=u.role, created_at=u.created_at)
+    return UserResponse(
+        id=u.id, email=u.email, full_name=u.full_name, role=u.role, created_at=u.created_at, is_active=u.is_active,
+    )
 
 
 # Frontend và backend KHÁC tên miền (VD: frontend trên Vercel, backend qua Cloudflare Tunnel):
@@ -51,7 +53,11 @@ def _set_media_cookie(response: Response, token: str, remember: bool, max_age: i
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    """Đăng ký tài khoản cán bộ (role 'officer'). Tài khoản admin không tự đăng ký được."""
+    """
+    Đăng ký tài khoản cán bộ (role 'officer'). Tài khoản admin không tự đăng ký được.
+    Mặc định tài khoản mới CHƯA kích hoạt (is_active=False): quản trị viên duyệt ở trang Quản lý tài khoản
+    rồi mới đăng nhập được. AUTO_APPROVE_REGISTRATION=1 trong .env: kích hoạt ngay.
+    """
     if db.query(User.id).filter(User.email == payload.email).first():
         raise HTTPException(status_code=409, detail="Email này đã được đăng ký")
     user = User(
@@ -59,6 +65,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         password_hash=hash_password(payload.password),
         full_name=payload.full_name,
         role="officer",
+        is_active=AUTO_APPROVE_REGISTRATION,
     )
     db.add(user)
     db.commit()
@@ -82,7 +89,7 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
             detail = "Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau 15 phút."
         raise HTTPException(status_code=401, detail=detail)
     if not user.is_active:
-        raise HTTPException(status_code=403, detail="Tài khoản đã bị khóa, vui lòng liên hệ quản trị viên")
+        raise HTTPException(status_code=403, detail="Tài khoản chưa được kích hoạt hoặc đã bị khóa, vui lòng liên hệ quản trị viên")
 
     login_limiter.reset(keys[0])   # đăng nhập đúng -> xóa đếm sai theo email
     token, session = create_session(db, user, payload.remember)

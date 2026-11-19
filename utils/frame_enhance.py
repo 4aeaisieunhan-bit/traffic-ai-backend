@@ -5,8 +5,7 @@
 #   1. fast_sharpen()           : Khử mờ toàn frame cực nhanh (4ms), tăng độ nét của xe, làn đường, biển báo.
 #   2. adaptive_contrast()      : Cân bằng ánh sáng cục bộ (CLAHE kênh L trong không gian LAB, không làm biến đổi màu).
 #   3. enhance_plate_crop()     : Tăng cường chi tiết ảnh crop biển số (Dynamic Gamma, CLAHE nhẹ, Lanczos-4, Edge Crispening).
-#   4. crop_high_res()          : Ánh xạ tọa độ từ 720p về độ phân giải gốc 4K để trích xuất ảnh biển số nét gấp 3 lần (9x pixel).
-#   5. enhance_frame()          : Pipeline tổng hợp làm sắc nét toàn bộ video hiển thị.
+#   4. enhance_frame()          : Pipeline tổng hợp làm sắc nét toàn bộ video hiển thị.
 
 import cv2
 import numpy as np
@@ -96,57 +95,6 @@ def enhance_frame(
 
     return out
 
-
-# Alias tương thích ngược
-auto_enhance_frame = enhance_frame
-
-
-def crop_high_res(
-    orig_frame: np.ndarray | None,
-    bbox_720: tuple | None,
-    frame_720_shape: tuple = (720, 1280),
-    pad: int = 4,
-) -> np.ndarray | None:
-    """
-    Trích xuất vùng ảnh (biển số / xe) trực tiếp từ khung hình gốc độ phân giải cao (4K/1080p)
-    dựa trên tọa độ bounding box phát hiện ở khung hình chuẩn 720p.
-
-    Nhờ đó vùng crop đạt độ phân giải tối đa (nhiều pixel gấp 9 lần so với cắt từ 720p),
-    loại bỏ hoàn toàn hiện tượng vỡ hạt, mờ nhòe khi hiển thị và nhận diện OCR.
-
-    Args:
-        orig_frame     : Khung hình gốc chất lượng cao (3840x2160 hoặc 1920x1080).
-        bbox_720       : (x1, y1, x2, y2) ở tọa độ 720p.
-        frame_720_shape: (height, width) chuẩn (mặc định 720, 1280).
-        pad            : Phần mở rộng lề pixel ở tọa độ 720p.
-
-    Returns:
-        Vùng ảnh crop độ nét cao từ khung hình gốc, hoặc None nếu thiếu dữ liệu / vùng crop rỗng.
-    """
-    if orig_frame is None or bbox_720 is None:
-        return None
-
-    h_720, w_720 = frame_720_shape[:2]
-    h_orig, w_orig = orig_frame.shape[:2]
-
-    scale_x = w_orig / float(w_720)
-    scale_y = h_orig / float(h_720)
-
-    x1, y1, x2, y2 = bbox_720
-    x1_pad = max(0, x1 - pad)
-    y1_pad = max(0, y1 - pad)
-    x2_pad = min(w_720, x2 + pad)
-    y2_pad = min(h_720, y2 + pad)
-
-    ox1 = max(0, int(x1_pad * scale_x))
-    oy1 = max(0, int(y1_pad * scale_y))
-    ox2 = min(w_orig, int(x2_pad * scale_x))
-    oy2 = min(h_orig, int(y2_pad * scale_y))
-
-    if oy2 <= oy1 or ox2 <= ox1:
-        return None
-
-    return orig_frame[oy1:oy2, ox1:ox2].copy()
 
 
 def enhance_plate_crop(

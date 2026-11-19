@@ -33,9 +33,13 @@ def parse_traffic_lights(traffic_light_boxes, class_names, conf_thresh=0.25):
             'green_right_arrow': bool,
             'green_left_arrow': bool,
             'red_left_arrow': bool,
+            'red_right_arrow': bool,
             'yellow_light': bool,
+            'yellow_left_arrow': bool,
+            'yellow_right_arrow': bool,
             'active_labels': list[str]
         }
+        Khóa trùng tên lớp của mô hình đèn (weights_demo/dengiaothong.pt).
     """
     state = {
         "red_light": False,
@@ -43,8 +47,10 @@ def parse_traffic_lights(traffic_light_boxes, class_names, conf_thresh=0.25):
         "green_right_arrow": False,
         "green_left_arrow": False,
         "red_left_arrow": False,
+        "red_right_arrow": False,
         "yellow_light": False,
         "yellow_left_arrow": False,
+        "yellow_right_arrow": False,
         "active_labels": [],
     }
 
@@ -63,6 +69,27 @@ def parse_traffic_lights(traffic_light_boxes, class_names, conf_thresh=0.25):
                 state["active_labels"].append(label)
 
     return state
+
+
+def straight_allowed(lights):
+    """Đi thẳng chỉ bị cấm khi đèn tròn đỏ. Mũi tên đỏ (trái / phải) chỉ cấm hướng rẽ tương ứng."""
+    return not lights.get("red_light", False)
+
+
+def turn_allowed(lights, direction):
+    """
+    Rẽ trái / phải có được phép không:
+    - Mũi tên xanh của hướng đó -> được phép.
+    - Mũi tên đỏ của hướng đó -> cấm (kể cả khi đèn tròn xanh).
+    - Không có mũi tên -> theo đèn tròn (cấm khi đỏ).
+    Không thấy đèn nào -> không có căn cứ kết luận vi phạm (giống đi thẳng).
+    """
+    side = "left" if direction == "LEFT" else "right"
+    if lights.get(f"green_{side}_arrow", False):
+        return True
+    if lights.get(f"red_{side}_arrow", False):
+        return False
+    return not lights.get("red_light", False)
 
 
 class TrafficViolationTracker:
@@ -107,6 +134,12 @@ class TrafficViolationTracker:
         self.right_guard_px = float(right_guard_px)
         # ByteTrack giữ ID tối đa 30 frame khi mất dấu -> quá ngưỡng này xe coi như đã mất hẳn
         self.lost_frames = max(31, int(self.fps * 0.6))
+
+        # Đèn tín hiệu không biến mất giữa chừng: frame mô hình không thấy đèn nào thì giữ trạng thái
+        # gần nhất tối đa 1 giây -> xe qua vạch đúng frame bị sót đèn vẫn được đối chiếu đúng.
+        self.light_hold_frames = max(int(self.fps * 1.0), 1)
+        self._held_lights = None
+        self._held_lights_frame = None
 
         # Điểm tụ phối cảnh (vanishing point) của các LÀN TIẾP CẬN, ước lượng tự động từ quỹ đạo trước vạch
         # của các xe đã qua vạch (các làn song song ngoài thực tế hội tụ về 1 điểm trên ảnh).
@@ -190,6 +223,10 @@ class TrafficViolationTracker:
         qua tâm `stopline_bbox`. ROI TOP / BOTTOM = hai phía của đường thẳng này (kéo dài hết khung hình).
         """
         light_state = parse_traffic_lights(traffic_light_boxes, light_names)
+        if light_state["active_labels"]:
+            self._held_lights, self._held_lights_frame = light_state, frame_idx
+        elif self._held_lights is not None and frame_idx - self._held_lights_frame <= self.light_hold_frames:
+            light_state = self._held_lights
 
         segment = stopline_segment
         if segment is None and stopline_bbox is not None:
@@ -376,12 +413,11 @@ class TrafficViolationTracker:
                     is_straight_deep = forward_depth >= self.deep_threshold_px and not_turning
                     is_straight_timeout = elapsed_frames >= self.max_observe_frames and forward_depth >= 25 and not_turning
 
-                    # Kiểm tra thêm: xe qua vạch dừng rồi đứng yên trong giao lộ / trên stopline quá observe_seconds kết hợp đèn đỏ
+                    # Kiểm tra thêm: xe qua vạch dừng KHI ĐÈN ĐỎ rồi đứng yên trong giao lộ quá observe_seconds.
+                    # Chỉ xét đèn lúc qua vạch: xe vào giao lộ khi đèn xanh rồi dừng chờ (VD chờ rẽ trái)
+                    # trong lúc đèn chuyển đỏ là hợp lệ.
                     cross_lights = v_info.get("lights_at_crossing") or light_state
-                    is_red_cross = (
-                        cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False)
-                        or light_state.get("red_light", False) or light_state.get("red_left_arrow", False)
-                    )
+                    is_red_cross = not straight_allowed(cross_lights)
                     is_still_timeout_on_red = elapsed_frames >= self.max_observe_frames and is_red_cross and not_turning
 
                     direction = None
@@ -394,7 +430,7 @@ class TrafficViolationTracker:
 
                     if direction is not None:
                         stood_still = is_still_timeout_on_red and forward_depth < 25
-                        self._resolve(track_id, v_info, direction, light_state, frame_idx, stood_still=stood_still)
+                        self._resolve(track_id, v_info, direction, cross_lights, frame_idx, stood_still=stood_still)
 
         # 4. Xe đang QUAN SÁT nhưng bị mất dấu (YOLO không còn phát hiện được, VD bị xe khác che khi đang rẽ):
         # kết luận theo phần quỹ đạo đã thấy thay vì để kẹt ở OBSERVING mãi mãi.
@@ -422,17 +458,15 @@ class TrafficViolationTracker:
                 is_right = dx > 15 and lane_offset >= self.right_guard_px
             else:
                 is_right = dx > 15 and dx + 0.80 * forward_depth >= 40
+            cross_lights = v_info["lights_at_crossing"] or light_state
             if is_right:
                 # Rẽ phải lệch sang phải rất sớm và rõ -> đủ tin cậy dù quỹ đạo ngắn
-                self._resolve(track_id, v_info, "RIGHT", light_state, frame_idx, note=" (mat dau)")
+                self._resolve(track_id, v_info, "RIGHT", cross_lights, frame_idx, note=" (mat dau)")
                 continue
             # Đoạn đầu của xe rẽ trái trông giống hệt xe đi thẳng (cùng tiến thẳng vào giao lộ trước khi ngoặt)
             # -> không đoán hướng. Chỉ kết luận khi đi thẳng và rẽ trái cho CÙNG kết quả theo đèn.
-            cross_lights = v_info["lights_at_crossing"] or light_state
-            straight_ok = not (cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False))
-            left_ok = cross_lights.get("green_left_arrow", False) or cross_lights.get("green_light", False)
-            if straight_ok == left_ok:
-                self._resolve(track_id, v_info, "STRAIGHT_OR_LEFT", light_state, frame_idx, note=" (mat dau)")
+            if straight_allowed(cross_lights) == turn_allowed(cross_lights, "LEFT"):
+                self._resolve(track_id, v_info, "STRAIGHT_OR_LEFT", cross_lights, frame_idx, note=" (mat dau)")
             else:
                 v_info["reason"] = "Mat dau: chua phan biet duoc di thang / re trai"
 
@@ -487,15 +521,17 @@ class TrafficViolationTracker:
 
     # ───────────────────────────── Kết luận hướng đi + đối chiếu đèn ─────────────────────────────
 
-    def _resolve(self, track_id, v_info, direction, light_state, frame_idx, stood_still=False, note=""):
-        """Gán hướng đi đã xác định cho xe và đối chiếu với tín hiệu đèn tại thời điểm vượt vạch."""
+    def _resolve(self, track_id, v_info, direction, cross_lights, frame_idx, stood_still=False, note=""):
+        """
+        Gán hướng đi đã xác định cho xe và đối chiếu với tín hiệu đèn TẠI THỜI ĐIỂM VƯỢT VẠCH (cross_lights).
+        Không dùng đèn hiện tại: xe vào giao lộ khi đèn xanh / vàng rồi đèn mới chuyển đỏ là hợp lệ.
+        """
         v_info["direction"] = direction
         v_info["resolved_frame"] = frame_idx
-        cross_lights = v_info["lights_at_crossing"] or light_state
 
         if direction == "STRAIGHT_OR_LEFT":
             # Chỉ gọi khi đi thẳng và rẽ trái cùng kết quả theo đèn tại thời điểm vượt vạch
-            if cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False):
+            if not straight_allowed(cross_lights):
                 self._mark_violation(track_id, v_info, "Vi pham: Di thang / re trai khi den do" + note)
             else:
                 v_info["status"] = VehicleStatus.LEGAL_PASS
@@ -504,11 +540,7 @@ class TrafficViolationTracker:
             return
 
         if direction == "STRAIGHT":
-            is_red = (
-                cross_lights.get("red_light", False) or cross_lights.get("red_left_arrow", False)
-                or light_state.get("red_light", False) or light_state.get("red_left_arrow", False)
-            )
-            if is_red:
+            if not straight_allowed(cross_lights):
                 if stood_still:
                     reason = f"Vi pham: Qua stopline va dung yen qua {self.observe_seconds:.1f}s khi den do"
                 else:
@@ -520,10 +552,8 @@ class TrafficViolationTracker:
                 self.straight_legal_count += 1
             return
 
-        arrow = "green_right_arrow" if direction == "RIGHT" else "green_left_arrow"
         side = "phai" if direction == "RIGHT" else "trai"
-        allowed = cross_lights.get(arrow, False) or light_state.get(arrow, False) or cross_lights.get("green_light", False)
-        if allowed:
+        if turn_allowed(cross_lights, direction):
             v_info["status"] = VehicleStatus.LEGITIMATE
             v_info["reason"] = f"Re {side} hop le (co den re {side})" + note
             if track_id not in self.legitimate_ids:

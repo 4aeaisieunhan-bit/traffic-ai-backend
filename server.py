@@ -16,7 +16,7 @@ from api.statistics import router as statistics_router
 from api.locations import router as locations_router
 from api.auth import router as auth_router
 from api.users import router as users_router
-from api.system import router as system_router, public_router as public_router
+from api.system import router as system_router
 from api.deps import MEDIA_COOKIE, find_valid_session, get_current_user
 from fastapi import Depends, Request
 from fastapi.concurrency import run_in_threadpool
@@ -117,9 +117,8 @@ app.include_router(locations_router, dependencies=_auth_required)
 app.include_router(analyze_router)
 # Quản lý tài khoản: chỉ admin (kiểm tra trong từng endpoint)
 app.include_router(users_router)
-# Trạng thái hệ thống / thông báo: đăng nhập (khai báo trong router); số liệu trang chủ: công khai (chỉ số đếm)
+# Trạng thái hệ thống / thông báo: đăng nhập (khai báo trong router)
 app.include_router(system_router)
-app.include_router(public_router)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import io
 import os
 from collections import Counter
 from typing import cast
+from xml.sax.saxutils import escape
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -157,14 +158,16 @@ def build_pdf(violations, filters: dict, generated_by: str) -> bytes:
     s = summarize(violations)
     story = [
         Paragraph("BÁO CÁO VI PHẠM GIAO THÔNG", st_title),
-        Paragraph(f"Hệ thống Traffic AI · Xuất lúc {datetime.datetime.now():%d/%m/%Y %H:%M} · Người xuất: {generated_by}", st_meta),
-        Paragraph(f"Bộ lọc: {_filters_text(filters)} · Tổng số hồ sơ: <b>{s['total']}</b>", st_meta),
+        # Paragraph hiểu cú pháp XML (<b>, &...) -> dữ liệu người dùng nhập phải escape, không thì PDF lỗi
+        Paragraph(f"Hệ thống Traffic AI · Xuất lúc {datetime.datetime.now():%d/%m/%Y %H:%M} · "
+                  f"Người xuất: {escape(generated_by)}", st_meta),
+        Paragraph(f"Bộ lọc: {escape(_filters_text(filters))} · Tổng số hồ sơ: <b>{s['total']}</b>", st_meta),
         Spacer(1, 6),
     ]
 
     # Bảng tổng hợp: 3 khối cạnh nhau
     def block(title, counter):
-        rows = [[title, "SL"]] + [[Paragraph(str(k), st_cell), str(n)] for k, n in counter.most_common(8)]
+        rows = [[title, "SL"]] + [[Paragraph(escape(str(k)), st_cell), str(n)] for k, n in counter.most_common(8)]
         t = Table(rows, colWidths=[62 * mm, 14 * mm])
         t.setStyle(TableStyle([
             ("FONT", (0, 0), (-1, 0), bold, 8), ("FONT", (0, 1), (-1, -1), font, 8),
@@ -182,7 +185,8 @@ def build_pdf(violations, filters: dict, generated_by: str) -> bytes:
     rows_src = violations[:PDF_MAX_ROWS]
     keep = [0, 1, 2, 3, 4, 5, 7, 9, 10]
     header = [COLUMNS[i][0] for i in keep]
-    data = [header] + [[Paragraph(str(_row(i, v)[k]), st_cell) for k in keep] for i, v in enumerate(rows_src, start=1)]
+    data = [header] + [[Paragraph(escape(str(row[k])), st_cell) for k in keep]
+                     for row in (_row(i, v) for i, v in enumerate(rows_src, start=1))]
     widths = [10, 22, 24, 52, 18, 52, 30, 20, 22]
     detail = Table(data, colWidths=[w * mm for w in widths], repeatRows=1)
     style = [

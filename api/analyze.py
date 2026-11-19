@@ -9,8 +9,9 @@ import uuid
 from typing import Optional
 
 import cv2
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from database.connection import SessionLocal, get_db
@@ -18,7 +19,7 @@ from database.lookups import (
     classify_reason, get_violation_type,
     next_violation_code, normalize_vehicle_type, violation_query,
 )
-from database.models import AnalysisTask, Location, TaskModelStat, User, Video, Violation
+from database.models import AnalysisTask, Location, TaskModelStat, User, Video, Violation, ViolationType
 from api.deps import get_current_user, require_admin
 from api.cleanup import delete_task_results, delete_video_if_orphan
 from schemas.violation import violation_to_response
@@ -47,7 +48,19 @@ class TaskCancelled(Exception):
     """Người dùng huỷ phân tích giữa chừng."""
 
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
-DEFAULT_VIDEO_CANDIDATES = ["21s_vidnew.mov", "video 18s.mp4"]
+# Video mẫu (không bắt buộc, không có trong Git vì dung lượng lớn): SAMPLE_VIDEO trong .env, hoặc một trong các
+# file dưới đây đặt ở thư mục backend. Không có -> giao diện ẩn lựa chọn "Video mẫu".
+DEFAULT_VIDEO_CANDIDATES = ["sample.mp4", "21s_vidnew.mov", "video 18s.mp4"]
+
+
+def _find_sample_video() -> Optional[str]:
+    env = os.getenv("SAMPLE_VIDEO", "").strip()
+    candidates = [env] if env else DEFAULT_VIDEO_CANDIDATES
+    for name in candidates:
+        path = name if os.path.isabs(name) else os.path.join(BASE_DIR, name)
+        if os.path.isfile(path):
+            return path
+    return None
 
 # Thông tin mô tả từng mô hình: (tên hiển thị, file weights, module chứa biến `model`)
 from utils.pipeline import MODEL_INFO  # noqa: E402  (khai báo duy nhất, dùng chung với main.py)
@@ -118,6 +131,9 @@ def _run_pipeline(task_id: str):
         db.rollback()
         task = db.get(AnalysisTask, task_id)
         if task:
+            # Giống khi huỷ: vi phạm / ảnh / video của lần chạy dở dang không đầy đủ (biển số chưa được cập nhật
+            # lần cuối) -> bỏ, người dùng phân tích lại
+            delete_task_results(db, task)
             task.status = "failed"
             task.error_message = str(e)[:1000]
             task.finished_at = datetime.datetime.now()
@@ -293,26 +309,38 @@ def _refresh_saved_plates(pipeline, saved) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def _get_or_create_sample_video(db: Session, location: Location) -> Video:
     """Video mẫu có sẵn trên server; dùng lại bản ghi nếu đã có cùng file + cùng địa điểm."""
-    for name in DEFAULT_VIDEO_CANDIDATES:
-        path = os.path.join(BASE_DIR, name)
-        if os.path.exists(path):
-            video = (
-                db.query(Video)
-                .filter(Video.stored_path == path, Video.location_id == location.id)
-                .first()
-            )
-            if video:
-                return video
-            video = Video(
-                original_name=name, stored_path=path,
-                file_size_mb=round(os.path.getsize(path) / (1024 * 1024), 2),
-                location_id=location.id,
-                **_video_meta(path),
-            )
-            db.add(video)
-            db.flush()
-            return video
-    raise HTTPException(status_code=400, detail="Không tìm thấy file video mẫu đầu vào")
+    path = _find_sample_video()
+    if path is None:
+        raise HTTPException(status_code=400, detail="Máy chủ không có video mẫu, vui lòng tải video lên")
+    video = db.query(Video).filter(Video.stored_path == path, Video.location_id == location.id).first()
+    if video:
+        return video
+    video = Video(
+        original_name=os.path.basename(path), stored_path=path,
+        file_size_mb=round(os.path.getsize(path) / (1024 * 1024), 2),
+        location_id=location.id,
+        **_video_meta(path),
+    )
+    db.add(video)
+    db.flush()
+    return video
+
+
+@router.get("/sample", dependencies=_AUTH)
+def get_sample_video():
+    """Thông tin video mẫu trên server (available=False nếu không có) để giao diện hiện / ẩn lựa chọn này."""
+    path = _find_sample_video()
+    if path is None:
+        return {"available": False}
+    meta = _video_meta(path)
+    return {
+        "available": True,
+        "name": os.path.basename(path),
+        "file_size_mb": round(os.path.getsize(path) / (1024 * 1024), 2),
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+        "duration_sec": meta.get("duration_sec"),
+    }
 
 
 @router.post("/start")
@@ -518,23 +546,34 @@ def _output_file(task: Optional[AnalysisTask]) -> Optional[str]:
 
 @router.get("/output/details", dependencies=_AUTH)
 def get_output_details(db: Session = Depends(get_db)):
-    """Thông tin video kết quả gần nhất + tổng hợp vi phạm + thống kê mô hình AI thật của lần chạy đó."""
+    """
+    Video kết quả gần nhất + thống kê mô hình AI của lần chạy đó + vi phạm CỦA LẦN CHẠY ĐÓ.
+    detection_summary.*_count / type_breakdown / violations_detected: tổng trên TOÀN BỘ hồ sơ (đếm bằng SQL,
+    không nạp từng dòng) — dùng cho các thẻ "Toàn bộ hồ sơ" trên trang Tổng quan.
+    """
+    from models.weights import weight_label
+
     task = _latest_completed_task(db)
     output_path = _output_file(task)
     meta = _video_meta(output_path) if output_path else {}
 
-    violations = violation_query(db).order_by(Violation.id.asc()).all()
-    type_counts = {}
-    for v in violations:
-        type_counts[v.violation_type.name] = type_counts.get(v.violation_type.name, 0) + 1
+    status_counts = dict(db.query(Violation.status, func.count(Violation.id)).group_by(Violation.status).all())
+    type_counts = dict(
+        db.query(ViolationType.name, func.count(Violation.id))
+        .join(Violation, Violation.violation_type_id == ViolationType.id)
+        .group_by(ViolationType.name).all()
+    )
+    task_violations = (
+        violation_query(db).filter(Violation.task_id == task.id).order_by(Violation.id.asc()).all() if task else []
+    )
 
     stats_by_name = {s.model_name: s for s in task.model_stats} if task else {}
     model_stats = {}
-    for key, (display, weight, module) in MODEL_INFO.items():
+    for key, (display, weight_path, module) in MODEL_INFO.items():
         s = stats_by_name.get(key)
         model_stats[key] = {
             "model_name": display,
-            "weight_file": weight,
+            "weight_file": s.weight_file if s else weight_label(weight_path),
             "detections": s.detections if s else 0,
             "avg_confidence": s.avg_confidence if s else None,
             "classes": _model_classes(module),
@@ -560,72 +599,23 @@ def get_output_details(db: Session = Depends(get_db)):
         "detection_summary": {
             "vehicles_scanned": task.vehicles_scanned if task else 0,
             "legitimate_turns": task.legitimate_turns if task else 0,
-            "violations_detected": len(violations),
-            "unprocessed_count": sum(1 for v in violations if v.status == "Chưa xử lý"),
-            "confirmed_count": sum(1 for v in violations if v.status == "Đã xác nhận"),
-            "rejected_count": sum(1 for v in violations if v.status == "Từ chối"),
+            "violations_detected": sum(status_counts.values()),
+            "unprocessed_count": status_counts.get("Chưa xử lý", 0),
+            "confirmed_count": status_counts.get("Đã xác nhận", 0),
+            "rejected_count": status_counts.get("Từ chối", 0),
             "type_breakdown": type_counts,
         },
         "model_stats": model_stats,
-        "violations": [violation_to_response(v).model_dump(mode="json") for v in violations],
-    }
-
-
-@router.get("/summary/latest", dependencies=_AUTH)
-def get_latest_analysis_summary(db: Session = Depends(get_db)):
-    """Tóm tắt video kết quả gần nhất."""
-    details = get_output_details(db)
-    v_info, d_sum = details["video_info"], details["detection_summary"]
-    return {
-        "video_name": v_info["file_name"],
-        "source_video": v_info["source_video"],
-        "video_size_mb": v_info["file_size_mb"],
-        "resolution": v_info["resolution"],
-        "total_frames": v_info["total_frames"],
-        "fps": v_info["fps"],
-        "duration_seconds": v_info["duration_seconds"],
-        "vehicles_scanned": d_sum["vehicles_scanned"],
-        "legitimate_turns": d_sum["legitimate_turns"],
-        "violations_count": d_sum["violations_detected"],
-        "video_stream_url": v_info["video_stream_url"],
-        "static_video_url": v_info["static_video_url"],
-        "violations": details["violations"],
+        # Chỉ vi phạm của lần phân tích gần nhất (danh sách đầy đủ: /api/v1/violations, có phân trang)
+        "violations": [violation_to_response(v).model_dump(mode="json") for v in task_violations],
     }
 
 
 @router.get("/video/output")
-def stream_output_video(request: Request, db: Session = Depends(get_db)):
-    """Phát video kết quả gần nhất, hỗ trợ HTTP 206 (Range) để tua."""
+def stream_output_video(db: Session = Depends(get_db)):
+    """Phát video kết quả gần nhất. FileResponse tự xử lý HTTP Range (206 / 416, nhiều khoảng) và đọc file
+    theo từng khối -> tua video không phải nạp cả file vào RAM."""
     video_path = _output_file(_latest_completed_task(db))
     if not video_path:
         raise HTTPException(status_code=404, detail="Không tìm thấy file video kết quả")
-
-    file_size = os.path.getsize(video_path)
-    range_header = request.headers.get("range")
-
-    if not range_header:
-        def iter_file():
-            with open(video_path, "rb") as f:
-                while chunk := f.read(1024 * 1024):
-                    yield chunk
-
-        return StreamingResponse(
-            iter_file(), media_type="video/mp4",
-            headers={"Content-Length": str(file_size), "Accept-Ranges": "bytes"},
-        )
-
-    parts = range_header.replace("bytes=", "").split("-")
-    start = int(parts[0]) if parts[0] else 0
-    end = min(int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1, file_size - 1)
-    length = end - start + 1
-    with open(video_path, "rb") as f:
-        f.seek(start)
-        data = f.read(length)
-    return Response(
-        content=data, status_code=status.HTTP_206_PARTIAL_CONTENT, media_type="video/mp4",
-        headers={
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(len(data)),
-        },
-    )
+    return FileResponse(video_path, media_type="video/mp4")

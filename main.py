@@ -1,25 +1,22 @@
 # main.py — chạy phân tích 1 video từ dòng lệnh: ghi output.mp4 + in bảng tổng kết.
 # Xử lý từng khung hình dùng CHUNG pipeline với giao diện web (utils/pipeline.py).
-#   Cách chạy:  python main.py                    (video mặc định)
-#               python main.py "video 18s.mp4"    (chọn video khác)
+#   Cách chạy:  python main.py "video 18s.mp4"                 (ghi output.mp4)
+#               python main.py "video 18s.mp4" ket_qua.mp4     (chọn tên file kết quả)
 import sys
 import time
 from collections import defaultdict
 
 import cv2
 
+from utils.labels import VIOLATION_TYPES, classify_reason
 from utils.pipeline import TrafficPipeline
 
 
 def violation_label(v: dict) -> str:
     """Tên loại vi phạm (giống bảng violation_types) từ 1 mục sidebar.violations_history.
-    Không import database.* để main.py chạy độc lập, không kết nối SQL Server."""
-    if v.get("kind") == "NO_HELMET":
-        return "Không đội mũ bảo hiểm"
-    reason = (v.get("reason") or "").lower()
-    if "dung yen" in reason or "stopline" in reason or "vach" in reason:
-        return "Không dừng đúng vạch khi đèn đỏ"
-    return "Vượt đèn đỏ"
+    Dùng utils/labels.py (không import database.*) để main.py chạy độc lập, không kết nối SQL Server."""
+    code = "NO_HELMET" if v.get("kind") == "NO_HELMET" else classify_reason(v.get("reason"))
+    return VIOLATION_TYPES[code][0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,4 +167,6 @@ def run(video_path: str, output_path: str = "output.mp4") -> None:
 
 
 if __name__ == "__main__":
-    run(sys.argv[1] if len(sys.argv) > 1 else "21s_vidnew.mov")
+    if len(sys.argv) < 2:
+        sys.exit('Cách chạy: python main.py "<đường dẫn video>" [video_ket_qua.mp4]')
+    run(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "output.mp4")

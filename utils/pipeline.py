@@ -6,19 +6,26 @@
 #
 # Mỗi khung hình: chuẩn hoá 1280x720 + tăng nét -> 5 mô hình YOLO -> vạch dừng -> theo dõi quỹ đạo (vượt đèn)
 # -> biển số -> vi phạm không đội mũ (toàn khung hình) -> vẽ khung + HUD -> ghép sidebar.
-import os
 from dataclasses import dataclass, field
 
 import cv2
 
-# Mô hình dùng trong pipeline: key -> (tên hiển thị, file weights, module)
+from models.weights import (
+    HELMET_WEIGHTS, LICENSE_PLATE_WEIGHTS, OCR_WEIGHTS, STOP_LINE_WEIGHTS, TRAFFIC_LIGHT_WEIGHTS,
+    VEHICLE_WEIGHTS,
+)
+
+# Mô hình phát hiện chạy trên mỗi khung hình: key -> (tên hiển thị, đường dẫn file weights, module)
+# Đường dẫn lấy từ models/weights.py — đúng file mà các module models/*.py thực sự nạp.
 MODEL_INFO = {
-    "Vehicle": ("Vehicle Detector + ByteTrack", "vehicle-26s-best.pt", "models.vehicle"),
-    "Traffic Light": ("Traffic Light Classifier", "light_traffic-26m-best.pt", "models.traffic_light"),
-    "Helmet": ("Helmet Detector", os.path.basename(os.getenv("HELMET_WEIGHTS", "helmet_26s.pt")), "models.helmet"),
-    "License Plate": ("License Plate Detector", "LP-26s-best.pt", "models.license_plate"),
-    "Stop Line": ("Stop Line Detector", "stop_line-26s-best.pt", "models.stop_line"),
+    "Vehicle": ("Vehicle Detector + ByteTrack", VEHICLE_WEIGHTS, "models.vehicle"),
+    "Traffic Light": ("Traffic Light Classifier", TRAFFIC_LIGHT_WEIGHTS, "models.traffic_light"),
+    "Helmet": ("Helmet Detector", HELMET_WEIGHTS, "models.helmet"),
+    "License Plate": ("License Plate Detector", LICENSE_PLATE_WEIGHTS, "models.license_plate"),
+    "Stop Line": ("Stop Line Detector", STOP_LINE_WEIGHTS, "models.stop_line"),
 }
+# Mô hình đọc ký tự biển số: chạy trên ảnh cắt biển số (không có thống kê theo khung hình)
+OCR_INFO = ("Plate Character OCR", OCR_WEIGHTS, "models.ocr")
 
 PROCESS_SIZE = (1280, 720)     # xử lý ở 1280x720: nhanh hơn ~5 lần so với 4K, ngưỡng thuật toán ổn định
 SIDEBAR_WIDTH = 416            # 1280 + 416 = 1696 chia hết cho 16 -> nén video không lỗi macroblock
@@ -29,7 +36,6 @@ class FrameResult:
     canvas: "cv2.typing.MatLike"                 # khung hình đã vẽ + sidebar (ghi vào video kết quả)
     new_violations: list = field(default_factory=list)   # vi phạm MỚI ghi nhận ở khung hình này
     evidence_frame: "cv2.typing.MatLike | None" = None   # khung hình 720p (chưa vẽ HUD) để lưu ảnh bằng chứng
-    orig_frame: "cv2.typing.MatLike | None" = None
 
 
 def reset_vehicle_tracker():
@@ -147,7 +153,7 @@ class TrafficPipeline:
             stopline_segment=self.stopline_segment,
         )
         canvas = self.sidebar.render(frame, frame_idx)
-        return FrameResult(canvas=canvas, new_violations=new_items, evidence_frame=evidence_frame, orig_frame=orig_frame)
+        return FrameResult(canvas=canvas, new_violations=new_items, evidence_frame=evidence_frame)
 
     # ───────────────────────────── thống kê ─────────────────────────────
     def avg_conf_pct(self, key: str) -> float | None:
@@ -156,9 +162,10 @@ class TrafficPipeline:
 
     def model_stats(self) -> dict:
         """{key: {weight, detections, avg_confidence (0..1) | None}}"""
+        from models.weights import weight_label
         return {
             key: {
-                "weight": MODEL_INFO[key][1],
+                "weight": weight_label(MODEL_INFO[key][1]),
                 "detections": s["detections"],
                 "avg_confidence": round(s["conf_sum"] / s["detections"], 4) if s["detections"] else None,
             }

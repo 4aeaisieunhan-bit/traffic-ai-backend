@@ -1,7 +1,8 @@
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
+from models.weights import LICENSE_PLATE_WEIGHTS
 from models.yolo_types import INFER_KW, as_results 
-model = YOLO("weights_demo/biensoxe.pt") 
+model = YOLO(LICENSE_PLATE_WEIGHTS) 
 def detect_license_plate(image) -> list[Results]:
     result = model.predict(
         source = image,

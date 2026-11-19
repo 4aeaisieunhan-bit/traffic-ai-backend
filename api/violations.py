@@ -135,7 +135,8 @@ def get_violation_counts(db: Session = Depends(get_db)):
     q = db.query(Violation)
     return {
         "totalViolations": q.count(),
-        "todayViolations": q.filter(Violation.created_at >= start, Violation.created_at < end).count(),
+        # Theo thời điểm vi phạm (occurred_at) — cùng trường với bộ lọc ngày và biểu đồ theo ngày
+        "todayViolations": q.filter(Violation.occurred_at >= start, Violation.occurred_at < end).count(),
         "pendingApproval": q.filter(Violation.status == "Chưa xử lý").count(),
         "confirmedViolations": q.filter(Violation.status == "Đã xác nhận").count(),
         "rejectedViolations": q.filter(Violation.status == "Từ chối").count(),

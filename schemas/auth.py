@@ -51,6 +51,7 @@ class UserResponse(BaseModel):
     full_name: str
     role: str
     created_at: datetime.datetime
+    is_active: bool = True   # False: tài khoản mới đăng ký đang chờ quản trị viên kích hoạt, hoặc đã bị khóa
 
 
 class ChangePasswordRequest(BaseModel):
@@ -60,7 +61,6 @@ class ChangePasswordRequest(BaseModel):
 
 # ---- Quản lý tài khoản (chỉ admin) ----
 class UserAdminResponse(UserResponse):
-    is_active: bool
     active_sessions: int = 0
 
 
