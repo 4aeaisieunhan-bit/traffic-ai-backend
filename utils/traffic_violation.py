@@ -656,69 +656,66 @@ class TrafficViolationTracker:
                 cv2.LINE_AA,
             )
 
-        # 3. Vẽ Dashboard HUD thông tin ở góc trên bên phải
-        panel_w, panel_h = 360, 125 + 26 * len(extra_lines)
-        px1 = w - panel_w - 15
-        py1 = 15
-        px2 = px1 + panel_w
-        py2 = py1 + panel_h
-
-        # Nền bán trong suốt cho HUD
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (px1, py1), (px2, py2), (20, 20, 20), -1)
-        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-        cv2.rectangle(frame, (px1, py1), (px2, py2), (100, 100, 100), 1)
-
-        # Tiêu đề HUD
-        cv2.putText(
-            frame,
-            "HE THONG PHAN TICH QUY DAO & VI PHAM",
-            (px1 + 10, py1 + 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # Số xe đang theo dõi quỹ đạo (chỉ tính các xe đang xuất hiện gần đây)
-        num_observing = sum(1 for v in self.vehicles.values() if v["status"] == VehicleStatus.OBSERVING and v.get("is_recognized", False) and (frame_idx - v.get("last_frame", 0) <= 5))
-        cv2.putText(
-            frame,
-            f"Dang quan sat quy dao: {num_observing} xe (Nguong {self.observe_seconds}s)",
-            (px1 + 10, py1 + 48),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # Số xe vi phạm
-        cv2.putText(
-            frame,
-            f"Vi pham vuot den do: {self.violation_count} xe",
-            (px1 + 10, py1 + 74),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # Số xe rẽ hợp lệ (phải + trái)
-        cv2.putText(
-            frame,
-            f"Re hop le: {self.legitimate_turn_count} (P:{self.legitimate_right_count} T:{self.legitimate_left_count})",
-            (px1 + 10, py1 + 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (0, 255, 128),
-            1,
-            cv2.LINE_AA,
-        )
-
-        for i, (text, color) in enumerate(extra_lines):
-            cv2.putText(frame, text, (px1 + 10, py1 + 126 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
-
+        # 3. Bảng thông tin góc trên bên phải (cùng phong cách thanh bên: nền tối, chữ có dấu, số canh phải)
+        self._draw_hud(frame, frame_idx, extra_lines)
         return frame
+
+    def _draw_hud(self, frame, frame_idx, extra_lines):
+        """
+        extra_lines: các hàng thêm [(nhãn, giá trị, màu chấm BGR)] — VD: ("Không đội mũ bảo hiểm", 5, màu hồng).
+        Vẫn nhận kiểu cũ (chuỗi, màu): khi đó cả chuỗi là nhãn, không có giá trị.
+        """
+        from utils.text_render import TextLayer
+
+        h, w = frame.shape[:2]
+        c_t1, c_t2, c_t3 = (243, 239, 237), (179, 168, 164), (143, 130, 125)
+        c_line, c_signal, c_ok = (48, 44, 41), (77, 72, 229), (138, 195, 76)
+
+        # Chỉ tính xe đang xuất hiện gần đây
+        num_observing = sum(
+            1 for v in self.vehicles.values()
+            if v["status"] == VehicleStatus.OBSERVING and v.get("is_recognized", False)
+            and frame_idx - v.get("last_frame", 0) <= 5
+        )
+        rows = [
+            ("Đang theo dõi quỹ đạo", str(num_observing), c_t3),
+            ("Vượt đèn đỏ", str(self.violation_count), c_signal),
+            (f"Rẽ hợp lệ (phải {self.legitimate_right_count}, trái {self.legitimate_left_count})",
+             str(self.legitimate_turn_count), c_ok),
+        ]
+        for extra in extra_lines:
+            if len(extra) == 3:
+                rows.append((extra[0], str(extra[1]), extra[2]))
+            else:
+                rows.append((extra[0], "", extra[1]))
+
+        pad, row_h, head_h = 14, 24, 36
+        panel_w = 280
+        panel_h = head_h + row_h * len(rows) + 8
+        px2, py1 = w - 16, 16
+        px1, py2 = px2 - panel_w, py1 + panel_h
+
+        # Nền tối gần như đặc (video vẫn thấp thoáng), viền mảnh, bo góc
+        roi = frame[py1:py2, px1:px2]
+        dark = np.full_like(roi, (13, 9, 8))
+        cv2.addWeighted(dark, 0.86, roi, 0.14, 0, roi)
+        r = 10
+        for (cx, cy), ang in (((px1 + r, py1 + r), 180), ((px2 - r, py1 + r), 270), ((px1 + r, py2 - r), 90), ((px2 - r, py2 - r), 0)):
+            cv2.ellipse(frame, (cx, cy), (r, r), ang, 0, 90, c_line, 1, cv2.LINE_AA)
+        cv2.line(frame, (px1 + r, py1), (px2 - r, py1), c_line, 1)
+        cv2.line(frame, (px1 + r, py2), (px2 - r, py2), c_line, 1)
+        cv2.line(frame, (px1, py1 + r), (px1, py2 - r), c_line, 1)
+        cv2.line(frame, (px2, py1 + r), (px2, py2 - r), c_line, 1)
+
+        T = TextLayer()
+        T.add(px1 + pad, py1 + 23, "Phân tích quỹ đạo", c_t1, 13, "sans-medium")
+        T.add(px2 - pad, py1 + 23, f"ngưỡng {self.observe_seconds:g} s", c_t3, 12, align="right")
+        cv2.line(frame, (px1 + pad, py1 + head_h - 2), (px2 - pad, py1 + head_h - 2), c_line, 1)
+
+        for i, (label, value, color) in enumerate(rows):
+            base = py1 + head_h + 17 + i * row_h
+            cv2.circle(frame, (px1 + pad + 3, base - 4), 3, color, -1, cv2.LINE_AA)
+            T.add(px1 + pad + 14, base, label, c_t2, 12)
+            T.add(px2 - pad, base, value, c_t1, 13, "mono", align="right")
+
+        T.flush(frame, px1, px2 + 1)

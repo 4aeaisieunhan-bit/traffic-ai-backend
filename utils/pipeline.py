@@ -137,7 +137,7 @@ class TrafficPipeline:
         # Vẽ: quỹ đạo + HUD -> đèn, mũ (khung vi phạm = chính khung mũ của mô hình), vạch dừng
         frame = self.tracker.draw_visuals(
             frame, frame_idx,
-            extra_lines=[(f"Khong doi mu bao hiem: {self.helmet_detector.violation_count} xe", NO_HELMET_COLOR)],
+            extra_lines=[("Không đội mũ bảo hiểm", self.helmet_detector.violation_count, NO_HELMET_COLOR)],
         )
         frame = draw_detections(
             frame,

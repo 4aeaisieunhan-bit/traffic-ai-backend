@@ -1,43 +1,74 @@
 # utils/violation_sidebar.py
-# Sidebar giám sát giao thông thời gian thực — phong cách Traffic AI Command Center
+# Thanh bên của video kết quả: hồ sơ vi phạm mới nhất + nhật ký biển số.
+# Thiết kế đồng bộ với giao diện web (theo skill unslop của Damir Sokolovsky, @heydamir, CC BY 4.0):
+# nền tối trung tính, 3 cấp chữ, 1 màu đỏ tín hiệu cho vi phạm, chữ tiếng Việt có dấu (IBM Plex, vẽ bằng Pillow).
 import cv2
 import numpy as np
 from models.ocr import read_plate_details, recognize_plate_text
 from models.license_plate import model as lp_yolo_model
 from models.vehicle import model as vehicle_yolo_model
 from models.yolo_types import INFER_KW, as_results
+from utils.text_render import TextLayer as _TextLayer
 
 # Xe có mép dưới bbox cách đáy khung hình <= số pixel này coi như đang bị cắt (biển số chưa vào khung)
 BOTTOM_EDGE_PX = 3
 
-# ─────────────────────────── MÀU SẮC THEME ───────────────────────────
-# Bảng màu: Nền tối + viền neon
-C_BG_DARK    = (18, 16, 24)       # Nền chính
-C_BG_MID     = (28, 24, 36)       # Nền card
-C_BG_HEADER  = (22, 18, 32)       # Nền header
-C_ACCENT     = (0, 215, 255)      # Cyan neon (màu chủ đạo)
-C_RED_NEON   = (0, 48, 220)       # Đỏ vi phạm
-C_RED_GLOW   = (20, 20, 100)      # Đỏ nhạt glow
-C_GREEN_NEON = (0, 230, 80)       # Xanh lá nhận diện
-C_GREEN_GLOW = (10, 60, 10)       # Xanh lá nhạt
-C_ORANGE     = (0, 140, 255)      # Cam cảnh báo
-C_WHITE      = (230, 230, 240)    # Trắng văn bản
-C_GRAY_L     = (160, 160, 180)    # Xám sáng (nhãn phụ)
-C_GRAY_D     = (60, 55, 75)       # Xám tối (đường kẻ)
-C_GOLD       = (40, 200, 255)     # Vàng neon
-C_PURPLE     = (180, 60, 120)     # Tím viền
-C_TEAL       = (180, 200, 10)     # Teal (ROI label)
+# ─────────────────────────── BẢNG MÀU (BGR) ───────────────────────────
+# Cùng token với web: --bg-deep, --card, --raised, --line, --t1/--t2/--t3, --signal, --positive
+C_BG     = (13, 9, 8)          # #08090d nền thanh bên
+C_CARD   = (25, 20, 18)        # #121419 thẻ
+C_RAISED = (36, 29, 26)        # #1a1d24 ô ảnh trống
+C_LINE   = (34, 31, 29)        # đường kẻ mảnh
+C_T1     = (243, 239, 237)     # #edeff3 chữ chính
+C_T2     = (179, 168, 164)     # #a4a8b3 chữ phụ
+C_T3     = (143, 130, 125)     # #7d828f chữ mờ, meta
+C_SIGNAL = (77, 72, 229)       # #e5484d vi phạm / vạch dừng
+C_OK     = (138, 195, 76)      # #4cc38a nhận diện hợp lệ
+
+# ─────────────────────────── NỘI DUNG HIỂN THỊ ───────────────────────────
+_REASON_VI = [
+    ("Khong doi mu bao hiem", "Không đội mũ bảo hiểm"),
+    ("Di thang / re trai khi den do", "Đi thẳng hoặc rẽ trái khi đèn đỏ"),
+    ("Di thang khi den do", "Đi thẳng khi đèn đỏ"),
+    ("Re trai khi den do", "Rẽ trái khi đèn đỏ"),
+    ("Re phai khi den do", "Rẽ phải khi đèn đỏ"),
+    ("Qua stopline va dung", "Qua vạch dừng khi đèn đỏ"),
+    ("Vuot den do", "Vượt đèn đỏ"),
+]
 
 
-def _draw_scan_line(canvas, x1, x2, y, color, alpha=0.4):
-    """Vẽ đường quét neon bán trong suốt."""
-    overlay = canvas.copy()
-    cv2.line(overlay, (x1, y), (x2, y), color, 1)
-    cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+def _reason_vi(reason):
+    """Lý do vi phạm (chuỗi không dấu từ thuật toán) -> câu tiếng Việt có dấu để hiển thị."""
+    r = (reason or "").strip()
+    for key, vi in _REASON_VI:
+        if key.lower() in r.lower():
+            return vi
+    return r.replace("Vi pham: ", "") or "Vi phạm"
 
 
-def _paste_fit(canvas, img, x, y, w, h, bg=(30, 28, 36)):
-    """Dán ảnh vào ô (x, y, w, h) giữ nguyên tỷ lệ, phần thừa tô nền tối (không méo hình người)."""
+def _vehicle_vi(cls_name):
+    t = (cls_name or "").lower()
+    if "motor" in t or "xe may" in t:
+        return "Xe máy"
+    if "bicycle" in t or "xe dap" in t:
+        return "Xe đạp"
+    if "bus" in t or "buyt" in t:
+        return "Xe buýt"
+    if "container" in t:
+        return "Xe container"
+    if "fire" in t or "cuu hoa" in t:
+        return "Xe cứu hỏa"
+    if "truck" in t or "tai" in t:
+        return "Xe tải"
+    if "car" in t or "hoi" in t or "o to" in t or "van" in t:
+        return "Ô tô"
+    return (cls_name or "Xe").capitalize()
+
+
+# ─────────────────────────── HÀM VẼ ẢNH / KHUNG ───────────────────────────
+
+def _paste_fit(canvas, img, x, y, w, h, bg=C_RAISED):
+    """Dán ảnh vào ô (x, y, w, h) giữ nguyên tỷ lệ, phần thừa tô màu nền (không méo hình)."""
     cv2.rectangle(canvas, (x, y), (x + w, y + h), bg, -1)
     ih, iw = img.shape[:2]
     if ih == 0 or iw == 0:
@@ -50,39 +81,46 @@ def _paste_fit(canvas, img, x, y, w, h, bg=(30, 28, 36)):
     canvas[oy:oy + nh, ox:ox + nw] = resized
 
 
+def _paste_cover(canvas, img, x, y, w, h, anchor_y=0.3):
+    """
+    Dán ảnh LẤP ĐẦY ô (x, y, w, h), giữ tỷ lệ: phóng cho phủ kín rồi cắt phần thừa.
+    anchor_y: vị trí giữ lại theo chiều dọc khi phải cắt (0 = giữ mép trên, 0.5 = giữa) —
+    ảnh cận cảnh người vi phạm có phần đầu ở phía trên nên giữ lệch lên trên.
+    """
+    ih, iw = img.shape[:2]
+    if ih == 0 or iw == 0 or w <= 0 or h <= 0:
+        return
+    s = max(w / float(iw), h / float(ih))
+    nw, nh = max(w, int(round(iw * s))), max(h, int(round(ih * s)))
+    interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LANCZOS4
+    resized = cv2.resize(img, (nw, nh), interpolation=interp)
+    ox = (nw - w) // 2
+    oy = int((nh - h) * anchor_y)
+    canvas[y:y + h, x:x + w] = resized[oy:oy + h, ox:ox + w]
+
+
 def _draw_rounded_rect(img, pt1, pt2, color, thickness=1, r=6, fill=None):
     """Vẽ hình chữ nhật với góc bo tròn."""
     x1, y1 = pt1
     x2, y2 = pt2
     if fill is not None:
-        # Lấp đầy nền
         cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), fill, -1)
         cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), fill, -1)
-        cv2.circle(img, (x1 + r, y1 + r), r, fill, -1)
-        cv2.circle(img, (x2 - r, y1 + r), r, fill, -1)
-        cv2.circle(img, (x1 + r, y2 - r), r, fill, -1)
-        cv2.circle(img, (x2 - r, y2 - r), r, fill, -1)
+        for cx, cy in ((x1 + r, y1 + r), (x2 - r, y1 + r), (x1 + r, y2 - r), (x2 - r, y2 - r)):
+            cv2.circle(img, (cx, cy), r, fill, -1, cv2.LINE_AA)
     if thickness > 0:
         cv2.line(img, (x1 + r, y1), (x2 - r, y1), color, thickness)
         cv2.line(img, (x1 + r, y2), (x2 - r, y2), color, thickness)
         cv2.line(img, (x1, y1 + r), (x1, y2 - r), color, thickness)
         cv2.line(img, (x2, y1 + r), (x2, y2 - r), color, thickness)
-        cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90, color, thickness)
-        cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90, color, thickness)
-        cv2.ellipse(img, (x1 + r, y2 - r), (r, r),  90, 0, 90, color, thickness)
-        cv2.ellipse(img, (x2 - r, y2 - r), (r, r),   0, 0, 90, color, thickness)
+        cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90, color, thickness, cv2.LINE_AA)
+        cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90, color, thickness, cv2.LINE_AA)
+        cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 90, 0, 90, color, thickness, cv2.LINE_AA)
+        cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0, 0, 90, color, thickness, cv2.LINE_AA)
 
 
-def _hex_pulse_dots(canvas, cx, y, n=3, r=3, color=C_ACCENT, frame_idx=0):
-    """Vẽ dãy chấm nhấp nháy (loading indicator)."""
-    gap = 10
-    total_w = (n - 1) * gap
-    sx = cx - total_w // 2
-    for i in range(n):
-        phase = (frame_idx // 8 + i) % n
-        alpha = 1.0 if phase == 0 else 0.3
-        c = tuple(int(ch * alpha) for ch in color)
-        cv2.circle(canvas, (sx + i * gap, y), r, c, -1)
+def _dot(canvas, x, y, color, r=3):
+    cv2.circle(canvas, (x, y), r, color, -1, cv2.LINE_AA)
 
 
 class PlateVoteTracker:
@@ -469,137 +507,79 @@ class ViolationSidebar:
         canvas = np.zeros((h, total_w, 3), dtype=np.uint8)
         canvas[:, :w] = frame
 
-        sx = w          # X bắt đầu sidebar
-        ex = total_w    # X kết thúc sidebar
+        sx = w          # X bắt đầu thanh bên
+        ex = total_w    # X kết thúc thanh bên
 
-        # ═══════════════ NỀN SIDEBAR ═══════════════
-        canvas[:, sx:ex] = C_BG_DARK
+        # Nền phẳng + 1 đường kẻ mảnh ngăn cách với video
+        canvas[:, sx:ex] = C_BG
+        cv2.line(canvas, (sx, 0), (sx, h), C_LINE, 1)
 
-        # Lưới nền dạng grid nhỏ (texture công nghệ)
-        for gy in range(0, h, 20):
-            cv2.line(canvas, (sx, gy), (ex, gy), (28, 24, 38), 1)
-        for gx in range(sx, ex, 20):
-            cv2.line(canvas, (gx, 0), (gx, h), (28, 24, 38), 1)
-
-        # ═══════════════ ĐƯỜNG PHÂN CÁCH SIDEBAR ═══════════════
-        # Viền neon 3 lớp (glow effect)
-        cv2.line(canvas, (sx, 0), (sx, h), (45, 40, 60), 4)
-        cv2.line(canvas, (sx + 1, 0), (sx + 1, h), C_ACCENT, 1)
-
+        self._text = _TextLayer()
         num_violations = len(self.violations_history)
         num_scanned = len(self.vehicle_plates)
 
-        # ═══════════════ HEADER ═══════════════
-        self._render_header(canvas, sx, ex, num_violations, num_scanned, frame_idx)
-
-        # ═══════════════ CARDS + LOG PANEL (adaptive layout) ═══════════════
+        self._render_header(canvas, sx, ex, num_violations, num_scanned)
         cards_bottom_y = self._render_cards(canvas, sx, ex, num_violations, h, frame_idx)
-
-        # ═══════════════ LOG PANEL KHU VỰC DƯỚI ═══════════════
         self._render_log_panel(canvas, sx, ex, num_violations, cards_bottom_y, h, frame_idx)
 
-        # ═══════════════ FOOTER ═══════════════
-        self._render_footer(canvas, sx, ex, h, frame_idx)
-
+        self._text.flush(canvas, sx, ex)
         return canvas
 
-    # ─────────────────── HEADER ───────────────────
+    # ─────────────────── ĐẦU THANH BÊN ───────────────────
 
-    def _render_header(self, canvas, sx, ex, num_vio, num_scan, frame_idx):
-        hdr_h = 68
-        # Nền header gradient giả
-        cv2.rectangle(canvas, (sx, 0), (ex, hdr_h), C_BG_HEADER, -1)
-        # Viền dưới header 2 màu
-        cv2.line(canvas, (sx, hdr_h - 2), (ex, hdr_h - 2), C_GRAY_D, 1)
-        cv2.line(canvas, (sx, hdr_h - 1), (ex, hdr_h - 1), C_ACCENT, 1)
+    def _render_header(self, canvas, sx, ex, num_vio, num_scan):
+        T = self._text
+        hdr_h = 56
 
-        # Icon radar/vòng tròn bên trái
-        ic_cx, ic_cy = sx + 24, 34
-        cv2.circle(canvas, (ic_cx, ic_cy), 14, (30, 25, 40), -1)
-        cv2.circle(canvas, (ic_cx, ic_cy), 14, C_ACCENT, 1)
-        cv2.circle(canvas, (ic_cx, ic_cy), 9,  C_ACCENT, 1)
-        cv2.circle(canvas, (ic_cx, ic_cy), 4,  C_ACCENT, -1)
-        # Đường kẻ chữ thập (radar crosshair)
-        cv2.line(canvas, (ic_cx - 14, ic_cy), (ic_cx + 14, ic_cy), C_ACCENT, 1)
-        cv2.line(canvas, (ic_cx, ic_cy - 14), (ic_cx, ic_cy + 14), C_ACCENT, 1)
+        # Biểu tượng đèn tín hiệu phẳng (giống logo web) + tên sản phẩm
+        mx, my = sx + 16, 19
+        _draw_rounded_rect(canvas, (mx, my), (mx + 12, my + 18), C_T1, thickness=1, r=3)
+        _dot(canvas, mx + 6, my + 5, C_T1, r=2)
+        _dot(canvas, mx + 6, my + 9, C_T3, r=2)
+        _dot(canvas, mx + 6, my + 13, C_T3, r=2)
+        T.add(sx + 38, 33, "Traffic AI", C_T1, 15, "sans-medium")
 
-        # Tiêu đề hệ thống
-        cv2.putText(canvas, "TRAFFIC AI MONITOR",
-                    (sx + 46, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, C_ACCENT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "HE THONG GIAM SAT GIAO THONG 4.0",
-                    (sx + 46, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, C_GRAY_L, 1, cv2.LINE_AA)
+        # Số liệu bên phải: con số (mono) + nhãn mờ
+        x = ex - 16
+        for num, label in ((num_scan, "xe đã quét"), (num_vio, "vi phạm")):
+            T.add(x, 33, label, C_T3, 12, "sans", align="right")
+            x -= T.width(label, 12) + 5
+            T.add(x, 33, str(num), C_T1, 13, "mono-medium", align="right")
+            x -= T.width(str(num), 13, "mono-medium") + 16
 
-        # Thanh thống kê nhanh — 2 chỉ số nằm trên 1 dòng
-        # --- Vi phạm ---
-        vio_x = sx + 10
-        cv2.rectangle(canvas, (vio_x, 46), (vio_x + 95, 62), C_RED_GLOW, -1)
-        cv2.rectangle(canvas, (vio_x, 46), (vio_x + 95, 62), C_RED_NEON, 1)
-        cv2.putText(canvas, f"VI PHAM: {num_vio}",
-                    (vio_x + 6, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0, 120, 255), 1, cv2.LINE_AA)
-        # --- Đã quét ---
-        sc_x = vio_x + 103
-        cv2.rectangle(canvas, (sc_x, 46), (sc_x + 100, 62), C_GREEN_GLOW, -1)
-        cv2.rectangle(canvas, (sc_x, 46), (sc_x + 100, 62), C_GREEN_NEON, 1)
-        cv2.putText(canvas, f"DA QUET: {num_scan}",
-                    (sc_x + 6, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.33, C_GREEN_NEON, 1, cv2.LINE_AA)
-        # --- LIVE badge ---
-        live_x = sc_x + 108
-        pulse = frame_idx % 24 < 12
-        badge_col = (0, 0, 200) if pulse else (20, 20, 80)
-        cv2.rectangle(canvas, (live_x, 46), (live_x + 55, 62), badge_col, -1)
-        cv2.rectangle(canvas, (live_x, 46), (live_x + 55, 62), (0, 60, 255), 1)
-        cv2.putText(canvas, "● LIVE",
-                    (live_x + 6, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0, 100, 255), 1, cv2.LINE_AA)
+        cv2.line(canvas, (sx, hdr_h), (ex, hdr_h), C_LINE, 1)
 
-    # ─────────────────── CARDS ───────────────────
+    # ─────────────────── THẺ HỒ SƠ ───────────────────
 
     def _render_cards(self, canvas, sx, ex, num_violations, h, frame_idx):
         """
-        Vẽ khu vực cards với layout thích ứng (adaptive):
-        - 0 vi phạm: 1 card standby
-        - 1–2 vi phạm: 2 card lớn (card_h=130) + log panel chiếm phần còn lại
-        - 3–5 vi phạm: 3 card nhỏ hơn (card_h=100)
-        - 6+ vi phạm: chỉ hiện 2 card highlight + toàn bộ chuyển xuống log panel
-
-        Trả về y cuối cùng của khu vực cards.
+        Khu vực thẻ, bố cục thích ứng theo số vi phạm (luôn chừa chỗ cho nhật ký):
+        - 0 vi phạm: 1 thẻ chờ
+        - 1–2 vi phạm: 2 thẻ
+        - 3–5 vi phạm: 3 thẻ thấp hơn
+        - 6+ vi phạm: 2 thẻ mới nhất, phần còn lại xem trong nhật ký
+        Trả về y cuối cùng của khu vực thẻ.
         """
-        card_y_start = 76
-        margin = 10
-        footer_h = 30
-        log_min_h = 180   # chiều cao tối thiểu cần giữ cho log panel
-
-        # Xác định số cards và chiều cao card dựa trên số vi phạm
-        # Luôn dành đủ chỗ cho log panel
-        available_h = h - card_y_start - log_min_h - footer_h
+        card_y_start = 68
+        margin = 12
+        card_gap = 8
+        log_min_h = 200
+        available_h = h - card_y_start - log_min_h - 12
 
         if num_violations == 0:
-            # Chưa có vi phạm: 1 card standby nhỏ
-            card_slots = 1
-            card_h = min(130, available_h - 6)
+            card_slots, card_h = 1, min(108, available_h)
         elif num_violations <= 2:
-            # Ít vi phạm: 2 card, hiển thị ảnh đầy đủ
-            card_slots = min(2, self.max_cards)
-            card_h = min(130, (available_h - 6) // 2)
+            card_slots, card_h = min(2, self.max_cards), min(108, (available_h - card_gap) // 2)
         elif num_violations <= 5:
-            # Trung bình: 3 card, thu nhỏ chiều cao để fit
-            card_slots = min(3, self.max_cards)
-            card_h = min(110, (available_h - 12) // 3)
+            card_slots, card_h = min(3, self.max_cards), min(96, (available_h - 2 * card_gap) // 3)
         else:
-            # Nhiều vi phạm (6+): chỉ hiện 2 card nổi bật mới nhất,
-            # phần còn lại dành hết cho log panel (hiển thị tất cả)
-            card_slots = 2
-            card_h = min(120, (available_h - 6) // 2)
+            card_slots, card_h = 2, min(104, (available_h - card_gap) // 2)
+        card_h = max(card_h, 88)
 
-        card_h = max(card_h, 90)   # tối thiểu 90px để hiển thị được ảnh
-        card_gap = 6
-
-        # Lập danh sách thẻ — vi phạm ưu tiên, còn slot thì thêm live plates
+        # Vi phạm ưu tiên, còn chỗ thì thêm xe vừa đọc được biển số
         cards = []
         for item in self.violations_history[:card_slots]:
             c = item.copy(); c["is_violation"] = True; cards.append(c)
-
         violation_tids = {v["track_id"] for v in self.violations_history}
         for item in self.live_recognized_plates:
             if len(cards) >= card_slots:
@@ -608,333 +588,163 @@ class ViolationSidebar:
                 c = item.copy(); c["is_violation"] = False; cards.append(c)
 
         if not cards:
-            self._render_standby(canvas, sx, ex, card_y_start, card_h, frame_idx)
-            return card_y_start + card_h + card_gap
+            self._render_standby(canvas, sx, ex, card_y_start, 88)
+            return card_y_start + 88 + card_gap
 
         curr_y = card_y_start
         for item in cards[:card_slots]:
             self._render_one_card(canvas, sx, ex, item, curr_y, card_h, margin, frame_idx)
             curr_y += card_h + card_gap
 
-        # Nếu số vi phạm vượt quá card_slots → hiển thị badge "+N xe vi phạm nữa"
         hidden = num_violations - card_slots
         if hidden > 0:
-            bx1 = sx + margin
-            bx2 = ex - margin
-            info_y1 = curr_y
-            info_y2 = curr_y + 22
-            cv2.rectangle(canvas, (bx1, info_y1), (bx2, info_y2), (28, 14, 10), -1)
-            cv2.rectangle(canvas, (bx1, info_y1), (bx2, info_y2), C_RED_NEON, 1)
-            cv2.putText(canvas,
-                        f"+ {hidden} xe vi pham khac  v  Xem trong Nhat ky bên duoi",
-                        (bx1 + 8, info_y1 + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (100, 100, 255), 1, cv2.LINE_AA)
-            curr_y = info_y2 + 4
+            self._text.add(sx + margin + 4, curr_y + 12, f"+{hidden} vi phạm khác trong nhật ký", C_T3, 12)
+            curr_y += 20
 
         return curr_y
 
-    def _render_standby(self, canvas, sx, ex, y_start, card_h, frame_idx):
-        """Màn hình chờ khi chưa có xe nào nhận diện."""
-        bx1, bx2 = sx + 10, ex - 10
-        by1, by2 = y_start, y_start + card_h
-        _draw_rounded_rect(canvas, (bx1, by1), (bx2, by2), C_GRAY_D, r=6, fill=C_BG_MID)
-
-        # Icon camera với vòng quét
-        ic_cx = sx + self.sidebar_width // 2
-        ic_cy = by1 + min(52, card_h // 2 - 10)
-        cv2.circle(canvas, (ic_cx, ic_cy), 22, C_GRAY_D, 1)
-        cv2.rectangle(canvas, (ic_cx - 12, ic_cy - 8), (ic_cx + 12, ic_cy + 8), C_GRAY_D, 1)
-        cv2.circle(canvas, (ic_cx, ic_cy), 5, C_GRAY_D, 1)
-
-        txt_y = ic_cy + 40
-        if txt_y < by2 - 10:
-            cv2.putText(canvas, "DANG QUAN SAT...",
-                        (bx1 + 70, txt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, C_GRAY_L, 1, cv2.LINE_AA)
-        if txt_y + 23 < by2 - 10:
-            cv2.putText(canvas, "Chua phat hien xe trong vung ROI",
-                        (bx1 + 30, txt_y + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.33, C_GRAY_D, 1, cv2.LINE_AA)
-        if txt_y + 43 < by2 - 2:
-            _hex_pulse_dots(canvas, ic_cx, txt_y + 43, frame_idx=frame_idx)
+    def _render_standby(self, canvas, sx, ex, y_start, card_h):
+        """Thẻ chờ khi chưa có xe nào được ghi nhận."""
+        x1, x2 = sx + 12, ex - 12
+        _draw_rounded_rect(canvas, (x1, y_start), (x2, y_start + card_h), C_LINE, r=10, fill=C_CARD)
+        cx = (x1 + x2) // 2
+        self._text.add(cx + self._text.width("Đang quan sát", 13, "sans-medium") // 2, y_start + 40,
+                       "Đang quan sát", C_T2, 13, "sans-medium", align="right")
+        self._text.add(cx + self._text.width("Chưa có xe vi phạm", 12) // 2, y_start + 60,
+                       "Chưa có xe vi phạm", C_T3, 12, align="right")
 
     def _render_one_card(self, canvas, sx, ex, item, cy1, card_h, margin, frame_idx):
-        """Vẽ 1 card xe — vi phạm hoặc nhận diện."""
+        """Một thẻ: ảnh người vi phạm (lỗi mũ) + ảnh biển số + lỗi, biển số, loại xe, thời điểm."""
+        T = self._text
         is_vio = item.get("is_violation", False)
-        cx1 = sx + margin
-        cx2 = ex - margin
+        cx1, cx2 = sx + margin, ex - margin
         cy2 = cy1 + card_h
+        pad = 12
+        top = cy1 + pad
+        content_h = card_h - 2 * pad
 
-        # ── Nền card ──
-        if is_vio:
-            fill_col = (22, 10, 10)
-            border_col = C_RED_NEON
-            strip_col = C_RED_NEON
-            glow_col = (40, 10, 80)
-        else:
-            fill_col = (10, 20, 18)
-            border_col = C_GREEN_NEON
-            strip_col = C_GREEN_NEON
-            glow_col = (10, 40, 20)
+        _draw_rounded_rect(canvas, (cx1, cy1), (cx2, cy2), C_LINE, r=10, fill=C_CARD)
 
-        _draw_rounded_rect(canvas, (cx1, cy1), (cx2, cy2), border_col, r=5, fill=fill_col)
+        x = cx1 + pad
 
-        # Vạch neon bên trái
-        cv2.rectangle(canvas, (cx1, cy1 + 5), (cx1 + 4, cy2 - 5), strip_col, -1)
-
-        # ── Badge góc trên phải ──
-        badge_text = "!! VI PHAM !!" if is_vio else "DA NHAN DIEN"
-        badge_col = C_RED_NEON if is_vio else (0, 140, 50)
-        badge_text_col = (255, 255, 255)
-        bw = 108 if is_vio else 100
-        bx1_b = cx2 - bw - 4
-        bx2_b = cx2 - 4
-        # Nhấp nháy badge vi phạm
-        if is_vio:
-            pulse = frame_idx % 20 < 10
-            badge_col = C_RED_NEON if pulse else (0, 20, 100)
-        _draw_rounded_rect(canvas, (bx1_b, cy1 + 5), (bx2_b, cy1 + 22), badge_text_col, r=3, fill=badge_col)
-        cv2.putText(canvas, badge_text,
-                    (bx1_b + 6, cy1 + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, badge_text_col, 1, cv2.LINE_AA)
-
-        # ── (Lỗi mũ) Ô DỌC TRÁI CÙNG: ảnh cận cảnh người vi phạm ──
+        # Ảnh cận cảnh người vi phạm (lỗi không đội mũ): lấp đầy khung, giữ phần đầu
         subject = item.get("subject_crop")
         has_subject = is_vio and subject is not None and subject.size > 0
-        img_x1 = cx1 + 10
         if has_subject:
-            sub_w, sub_h = 62, max(40, card_h - 50)
-            sub_y1 = cy1 + 14
-            _paste_fit(canvas, subject, img_x1, sub_y1, sub_w, sub_h)
-            _draw_rounded_rect(canvas, (img_x1 - 1, sub_y1 - 1), (img_x1 + sub_w + 1, sub_y1 + sub_h + 1),
-                               C_RED_NEON, r=3, thickness=1)
-            img_x1 += sub_w + 8
+            sub_w = 64
+            _paste_cover(canvas, subject, x, top, sub_w, content_h, anchor_y=0.25)
+            cv2.rectangle(canvas, (x, top), (x + sub_w, top + content_h), C_LINE, 1)
+            x += sub_w + 8
 
-        # ── PHẦN TRÁI: ảnh crop biển số ──
-        img_y1 = cy1 + 14
-        img_w, img_h = (96, 44) if has_subject else (118, 54)
-        img_x2 = img_x1 + img_w
-        img_y2 = img_y1 + img_h
-
+        # Ảnh biển số: giữ đúng tỷ lệ, khung ôm sát ảnh
+        area_w, area_h = (76 if has_subject else 88), min(52, content_h)
         plate_crop = item.get("plate_crop")
         if plate_crop is not None and plate_crop.size > 0:
+            ph, pw = plate_crop.shape[:2]
+            s = min(area_w / float(pw), area_h / float(ph))
+            iw, ih = max(1, int(round(pw * s))), max(1, int(round(ph * s)))
             try:
-                # Nếu ảnh crop lớn hơn khung hiển thị (từ 4K), dùng INTER_AREA để ảnh thu nhỏ siêu nét
-                # Nếu ảnh nhỏ hơn, dùng INTER_LANCZOS4 để phóng to mượt mà
-                if plate_crop.shape[1] >= img_w and plate_crop.shape[0] >= img_h:
-                    interp = cv2.INTER_AREA
-                else:
-                    interp = cv2.INTER_LANCZOS4
-                resized = cv2.resize(plate_crop, (img_w, img_h), interpolation=interp)
-                canvas[img_y1:img_y2, img_x1:img_x2] = resized
+                interp = cv2.INTER_AREA if iw < pw else cv2.INTER_LANCZOS4
+                canvas[top:top + ih, x:x + iw] = cv2.resize(plate_crop, (iw, ih), interpolation=interp)
             except Exception:
-                cv2.rectangle(canvas, (img_x1, img_y1), (img_x2, img_y2), C_GRAY_D, -1)
+                cv2.rectangle(canvas, (x, top), (x + iw, top + ih), C_RAISED, -1)
+            cv2.rectangle(canvas, (x, top), (x + iw, top + ih), C_LINE, 1)
         else:
-            cv2.rectangle(canvas, (img_x1, img_y1), (img_x2, img_y2), (30, 28, 36), -1)
-            cv2.putText(canvas, "NO IMG",
-                        (img_x1 + 25, img_y1 + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.38, C_GRAY_D, 1)
+            cv2.rectangle(canvas, (x, top), (x + area_w, top + area_h), C_RAISED, -1)
+            T.add(x + 10, top + area_h // 2 + 4, "Chưa có ảnh", C_T3, 11)
 
-        # Viền neon quanh ảnh biển
-        _draw_rounded_rect(canvas, (img_x1 - 1, img_y1 - 1), (img_x2 + 1, img_y2 + 1),
-                           strip_col, r=3, thickness=1)
-        cv2.putText(canvas, "BIEN SO",
-                    (img_x1 + (img_w - 44) // 2, img_y2 + 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, C_GRAY_L, 1, cv2.LINE_AA)
+        # Cột chữ (vị trí cố định để các thẻ thẳng hàng)
+        col_x = x + area_w + 16
+        col_r = cx2 - pad
+        col_w = col_r - col_x
 
-        # ── PHẦN PHẢI: thông tin văn bản ──
-        info_x = img_x2 + 12
-        # Nhãn nhỏ "OCR"
-        cv2.putText(canvas, "OCR BIEN SO:",
-                    (info_x, cy1 + 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, C_GRAY_L, 1, cv2.LINE_AA)
-        # Chữ biển số to + màu nổi bật
-        plate_txt = item.get("plate_text", "---")
-        txt_col = (0, 60, 255) if is_vio else C_ACCENT
-        cv2.putText(canvas, plate_txt,
-                    (info_x, cy1 + 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, txt_col, 2, cv2.LINE_AA)
-
-        # Loại xe + ID
-        cls_name = item.get("cls_name", "xe").upper()
-        tid = item.get("track_id", 0)
-        cv2.putText(canvas, f"{cls_name}  ID#{tid:03d}",
-                    (info_x, cy1 + 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, C_GRAY_L, 1, cv2.LINE_AA)
-
-        # ── DÒNG THÔNG TIN DƯỚI CARD ──
-        bottom_y = cy1 + card_h - 32
-
-        # Đường kẻ ngang phân cách
-        cv2.line(canvas, (cx1 + 8, bottom_y - 2), (cx2 - 8, bottom_y - 2), C_GRAY_D, 1)
-
+        # Dòng 1: chấm trạng thái + lỗi vi phạm (cả chiều rộng cột)
         if is_vio:
-            reason = item.get("reason", "Vuot den do")
-            cv2.putText(canvas, f"LOI: {reason[:30]}",
-                        (cx1 + 10, bottom_y + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100, 100, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, item.get("time_str", ""),
-                        (cx2 - 90, bottom_y + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, C_GOLD, 1, cv2.LINE_AA)
-            # Góc dưới phải: tag
-            cv2.putText(canvas, "[CAM]",
-                        (cx1 + 10, cy2 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, C_RED_NEON, 1, cv2.LINE_AA)
+            status_col, status_txt = C_SIGNAL, _reason_vi(item.get("reason"))
+            time_txt = (item.get("time_str") or "").rstrip("s")
         else:
-            cv2.putText(canvas, "Luu thong hop le — ROI Bottom",
-                        (cx1 + 10, bottom_y + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, C_GREEN_NEON, 1, cv2.LINE_AA)
-            cv2.putText(canvas, f"F{item.get('frame_idx', 0):05d}",
-                        (cx2 - 70, bottom_y + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, C_TEAL, 1, cv2.LINE_AA)
-            cv2.putText(canvas, "[SCAN]",
-                        (cx1 + 10, cy2 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, C_GREEN_NEON, 1, cv2.LINE_AA)
+            status_col, status_txt = C_OK, "Đã nhận diện"
+            t = item.get("frame_idx", 0) / self.fps
+            time_txt = f"{int(t // 60):02d}:{t % 60:04.1f}"
+        _dot(canvas, col_x + 3, top + 8, status_col)
+        T.add(col_x + 12, top + 12, T.fit(status_txt, col_w - 12, 13, "sans-medium"),
+              C_T1 if is_vio else C_T2, 13, "sans-medium")
 
-    # ─────────────────── LOG PANEL ───────────────────
+        # Dòng 2: biển số
+        plate_txt = item.get("plate_text") or "—"
+        T.add(col_x, top + 38, T.fit(plate_txt, col_w, 20, "mono-medium"), C_T1, 20, "mono-medium")
+
+        # Dòng 3: loại xe · mã theo dõi, thời điểm bên phải
+        meta = f"{_vehicle_vi(item.get('cls_name'))} · ID {item.get('track_id', 0)}"
+        time_w = T.width(time_txt, 12, "mono")
+        T.add(col_r, top + 58, time_txt, C_T3, 12, "mono", align="right")
+        T.add(col_x, top + 58, T.fit(meta, col_w - time_w - 12, 12), C_T3, 12)
+
+    # ─────────────────── NHẬT KÝ VI PHẠM ───────────────────
 
     def _render_log_panel(self, canvas, sx, ex, num_vio, top_y, h, frame_idx):
         """
-        Bảng danh sách tất cả biển số vi phạm dạng bảng kỹ thuật số.
-        - Số hàng tự động tính theo không gian còn lại (adaptive).
-        - Hiện tất cả vi phạm, không giới hạn cứng.
-        - Nếu danh sách dài hơn số hàng hiển thị: cuộn tự động theo thời gian (auto-scroll).
+        Bảng tất cả biển số vi phạm, mới nhất ở trên.
+        Số hàng tự tính theo chỗ còn lại; danh sách dài hơn thì tự cuộn chậm theo thời gian.
         """
-        footer_h = 28
-        log_x1 = sx + 8
-        log_x2 = ex - 8
-        log_y1 = top_y + 6
-        log_y2 = h - footer_h
-
-        # Đảm bảo log panel luôn có tối thiểu 60px
-        if log_y2 - log_y1 < 60:
+        T = self._text
+        x1, x2 = sx + 16, ex - 16
+        y1 = top_y + 12
+        y2 = h - 12
+        if y2 - y1 < 72:
             return
 
-        # Nền panel
-        _draw_rounded_rect(canvas, (log_x1, log_y1), (log_x2, log_y2),
-                           C_GRAY_D, r=5, fill=(20, 18, 28))
+        cv2.line(canvas, (sx, y1 - 4), (ex, y1 - 4), C_LINE, 1)
 
-        # ── Header log panel ──
-        hdr_h = 26
-        hdr_y2 = log_y1 + hdr_h
-        cv2.rectangle(canvas, (log_x1, log_y1), (log_x2, hdr_y2), (28, 22, 40), -1)
-        cv2.line(canvas, (log_x1, hdr_y2), (log_x2, hdr_y2), C_ORANGE, 1)
+        # Tiêu đề
+        T.add(x1, y1 + 18, "Nhật ký vi phạm", C_T1, 13, "sans-medium")
 
-        cv2.circle(canvas, (log_x1 + 12, log_y1 + 13), 4, C_ORANGE, -1)
-        cv2.putText(canvas, "NHAT KY VI PHAM",
-                    (log_x1 + 24, log_y1 + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, C_ORANGE, 1, cv2.LINE_AA)
+        # Cột
+        col_y = y1 + 44
+        cols = (x1, x1 + 30, x1 + 172)
+        T.add(cols[0], col_y, "#", C_T3, 12)
+        T.add(cols[1], col_y, "Biển số", C_T3, 12)
+        T.add(cols[2], col_y, "Loại xe", C_T3, 12)
+        T.add(x2, col_y, "Thời điểm", C_T3, 12, align="right")
+        cv2.line(canvas, (x1, col_y + 8), (x2, col_y + 8), C_LINE, 1)
 
-        # Badge tổng số — đổi màu khi nhiều vi phạm
-        badge_col = (0, 60, 200) if num_vio >= 5 else C_GREEN_NEON
-        badge_txt = f"TONG: {num_vio}"
-        cv2.putText(canvas, badge_txt,
-                    (log_x2 - 76, log_y1 + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, badge_col, 1, cv2.LINE_AA)
-
-        # ── Tiêu đề cột ──
-        col_y = hdr_y2 + 18
-        if col_y >= log_y2 - 10:
-            return
-        cv2.putText(canvas, "STT",      (log_x1 + 6,   col_y), cv2.FONT_HERSHEY_SIMPLEX, 0.29, C_GRAY_L, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "BIEN SO",  (log_x1 + 36,  col_y), cv2.FONT_HERSHEY_SIMPLEX, 0.29, C_GRAY_L, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "LOAI XE",  (log_x1 + 155, col_y), cv2.FONT_HERSHEY_SIMPLEX, 0.29, C_GRAY_L, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "GIO",      (log_x1 + 258, col_y), cv2.FONT_HERSHEY_SIMPLEX, 0.29, C_GRAY_L, 1, cv2.LINE_AA)
-        cv2.line(canvas, (log_x1 + 4, col_y + 5), (log_x2 - 4, col_y + 5), C_GRAY_D, 1)
-
-        if not self.violations_history:
-            mid_y = (log_y1 + log_y2) // 2 + 15
-            cv2.putText(canvas, "[ CHUA CO VI PHAM DUOC GHI NHAN ]",
-                        (log_x1 + 14, mid_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.33, C_GRAY_D, 1, cv2.LINE_AA)
+        total = len(self.violations_history)
+        if not total:
+            T.add(x1, y1 + 18, "", C_T3)
+            T.add(x2, y1 + 18, "0 hồ sơ", C_T3, 12, align="right")
+            T.add(x1, col_y + 34, "Chưa có vi phạm nào", C_T3, 12)
             return
 
-        # ── Tính số hàng tối đa vừa với không gian ──
-        row_y_start = col_y + 18
-        row_h = 20
-        max_rows = max(1, (log_y2 - row_y_start - 6) // row_h)
+        row_h = 24
+        first_base = col_y + 8 + 17
+        max_rows = max(1, (y2 - (col_y + 8)) // row_h)
 
-        total_vio = len(self.violations_history)
-
-        # Auto-scroll: nếu số vi phạm vượt quá max_rows, cuộn chậm
-        # Cứ 90 frame (3 giây) dịch chuyển 1 hàng, sau đó quay lại đầu
-        if total_vio > max_rows:
-            scroll_period = max_rows * 90        # thời gian để cuộn hết 1 vòng
-            scroll_offset = (frame_idx // 90) % total_vio
-            # Giữ scroll_offset trong giới hạn sao cho vẫn hiển thị đủ max_rows
-            scroll_offset = min(scroll_offset, total_vio - max_rows)
+        # Tự cuộn 1 hàng mỗi 90 khung hình khi danh sách dài hơn số hàng hiển thị
+        if total > max_rows:
+            offset = min((frame_idx // 90) % total, total - max_rows)
+            T.add(x2, y1 + 18, f"{offset + 1}–{min(offset + max_rows, total)} / {total}", C_T3, 12, "mono", align="right")
         else:
-            scroll_offset = 0
+            offset = 0
+            T.add(x2, y1 + 18, f"{total} hồ sơ", C_T3, 12, align="right")
 
-        # Hiển thị indicator cuộn nếu danh sách bị cắt
-        if total_vio > max_rows:
-            scroll_txt = f"^ Cuon  {scroll_offset + 1}–{min(scroll_offset + max_rows, total_vio)}/{total_vio}"
-            cv2.putText(canvas, scroll_txt,
-                        (log_x2 - 130, col_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.26, C_TEAL, 1, cv2.LINE_AA)
+        for i, item in enumerate(self.violations_history[offset: offset + max_rows]):
+            stt = total - (offset + i)          # mới nhất = số lớn nhất
+            base = first_base + i * row_h
+            newest = stt == total
+            T.add(cols[0], base, f"{stt:02d}", C_T3, 12, "mono")
+            if newest:
+                _dot(canvas, cols[1] - 9, base - 4, C_SIGNAL)
+            T.add(cols[1], base, T.fit(item.get("plate_text") or "—", cols[2] - cols[1] - 8, 13, "mono-medium"),
+                  C_T1, 13, "mono-medium")
+            T.add(cols[2], base, _vehicle_vi(item.get("cls_name")), C_T2, 12)
+            T.add(x2, base, (item.get("time_str") or "").rstrip("s"), C_T2, 12, "mono", align="right")
+            if i < max_rows - 1:
+                cv2.line(canvas, (x1, base + 7), (x2, base + 7), C_LINE, 1)
 
-        # In các hàng
-        row_y = row_y_start
-        display_items = self.violations_history[scroll_offset: scroll_offset + max_rows]
-
-        for i, item in enumerate(display_items):
-            # Số thứ tự thực tế (mới nhất = 1)
-            real_idx = scroll_offset + i
-            stt = total_vio - real_idx
-
-            # Màu nền hàng xen kẽ; hàng mới nhất (stt == total_vio) sáng hơn
-            if stt == total_vio:
-                row_bg = (38, 20, 20)   # Đỏ nhạt: vi phạm mới nhất
-            else:
-                row_bg = (26, 22, 36) if i % 2 == 0 else (20, 18, 28)
-
-            cv2.rectangle(canvas,
-                          (log_x1 + 2, row_y - row_h + 4),
-                          (log_x2 - 2, row_y + 4),
-                          row_bg, -1)
-
-            # Chấm màu đầu hàng
-            dot_col = C_RED_NEON if stt == total_vio else C_GRAY_D
-            cv2.circle(canvas, (log_x1 + 4, row_y - 6), 3, dot_col, -1)
-
-            cv2.putText(canvas, f"#{stt:02d}",
-                        (log_x1 + 10, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.31, C_ORANGE, 1, cv2.LINE_AA)
-            cv2.putText(canvas, item["plate_text"][:14],
-                        (log_x1 + 36, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, C_ACCENT, 1, cv2.LINE_AA)
-            cv2.putText(canvas, item["cls_name"][:8].upper(),
-                        (log_x1 + 155, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.28, C_WHITE, 1, cv2.LINE_AA)
-            cv2.putText(canvas, item["time_str"],
-                        (log_x1 + 258, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.28, C_GREEN_NEON, 1, cv2.LINE_AA)
-
-            row_y += row_h
-
-        # Thanh cuộn dọc (scrollbar) bên phải nếu cần
-        if total_vio > max_rows:
-            sb_x = log_x2 - 5
-            sb_y1 = row_y_start
-            sb_y2 = log_y2 - 4
-            sb_h = sb_y2 - sb_y1
-            # Vị trí thanh trượt
-            thumb_ratio = max_rows / total_vio
-            thumb_h = max(10, int(sb_h * thumb_ratio))
-            thumb_top = sb_y1 + int(sb_h * scroll_offset / total_vio)
-            cv2.rectangle(canvas, (sb_x, sb_y1), (sb_x + 3, sb_y2), C_GRAY_D, -1)
-            cv2.rectangle(canvas, (sb_x, thumb_top), (sb_x + 3, min(thumb_top + thumb_h, sb_y2)), C_ORANGE, -1)
-
-    # ─────────────────── FOOTER ───────────────────
-
-    def _render_footer(self, canvas, sx, ex, h, frame_idx):
-        """Footer: nhãn hệ thống + thanh tiến trình."""
-        fy = h - 26
-        cv2.line(canvas, (sx, fy - 2), (ex, fy - 2), C_GRAY_D, 1)
-        cv2.rectangle(canvas, (sx, fy - 2), (ex, h), (16, 14, 22), -1)
-
-        # Chữ footer
-        cv2.putText(canvas, "TRAFFIC AI v2.0  |  YOLO + ELECTRA OCR",
-                    (sx + 10, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, C_GRAY_D, 1, cv2.LINE_AA)
-
-        # Thanh nhỏ bên phải — nhấp nháy RECORD
-        pulse = frame_idx % 30 < 15
-        rc = (0, 0, 200) if pulse else (30, 20, 60)
-        cv2.circle(canvas, (ex - 16, h - 13), 4, rc, -1)
-        cv2.putText(canvas, "REC",
-                    (ex - 36, h - 9),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, rc, 1, cv2.LINE_AA)
+        # Thanh cuộn mảnh khi danh sách bị cắt
+        if total > max_rows:
+            sb_x = ex - 6
+            sb_y1, sb_y2 = col_y + 12, y2
+            thumb_h = max(12, int((sb_y2 - sb_y1) * max_rows / total))
+            thumb_top = sb_y1 + int((sb_y2 - sb_y1) * offset / total)
+            cv2.line(canvas, (sb_x, thumb_top), (sb_x, min(thumb_top + thumb_h, sb_y2)), C_T3, 2)
