@@ -29,7 +29,7 @@ debug_out.txt
 Thumbs.db
 
 
-# Dữ liệu huấn luyện lại mô hình (tools/helmet_*.py) và kết quả train của Ultralytics
+# Dữ liệu huấn luyện và kết quả train của Ultralytics
 dataset/
 runs/
 
