@@ -77,6 +77,7 @@ class TrafficPipeline:
         self.stopline_stabilizer = StoplineStabilizer()          # median theo thời gian, tự khóa khi ổn định
         self.stats = {k: {"detections": 0, "conf_sum": 0.0} for k in MODEL_INFO}
         self.no_helmet_conf: dict[int, float] = {}               # track_id -> độ tin cậy no_helmet TB (0..1)
+        self.seen_track_ids: set[int] = set()                    # mọi ID xe ByteTrack đã gán -> "phương tiện đã quét"
         reset_vehicle_tracker()
 
     @property
@@ -104,6 +105,8 @@ class TrafficPipeline:
                 self.stats[key]["detections"] += len(boxes)
                 self.stats[key]["conf_sum"] += float(boxes.conf.sum())
         vehicle, light, helmet, plate = res["Vehicle"][0], res["Traffic Light"][0], res["Helmet"][0], res["License Plate"][0]
+        if vehicle.boxes is not None and vehicle.boxes.id is not None:
+            self.seen_track_ids.update(int(i) for i in vehicle.boxes.id.tolist())
 
         # Vạch dừng: chọn khung tin cậy nhất nằm trong khoảng 35–65% chiều cao, rồi đưa qua bộ ổn định
         # (median nhiều frame + khóa khi camera cố định; giữ lại khi mất dấu)

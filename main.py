@@ -32,6 +32,7 @@ def print_summary(
     sidebar,
     model_stats: dict,
     helmet_detector=None,
+    scanned_vehicles: int = 0,
 ):
     """In bảng tóm tắt kết quả xử lý video và thống kê từng mô hình AI.
 
@@ -45,6 +46,7 @@ def print_summary(
         sidebar:          Đối tượng ViolationSidebar.
         model_stats:      Dict chứa stats từng model: {tên_model: {"weight": str,
                           "detections": int, "conf_sum": float, "conf_count": int}}
+        scanned_vehicles: Số xe khác nhau đã theo dõi (số ID ByteTrack duy nhất).
     """
     duration_sec = total_frames / fps if fps > 0 else 0
     sep = "═" * 70
@@ -60,8 +62,8 @@ def print_summary(
     print(f"   Tổng frame : {total_frames:,}")
     print(f"   FPS        : {fps:.2f}")
     print(f"   Thời lượng : {duration_sec:.1f}s")
-    print(f"   Thời gian xử lý: {elapsed_sec:.1f}s  "
-          f"(tốc độ: {total_frames / elapsed_sec:.1f} FPS)")
+    speed = f"{total_frames / elapsed_sec:.1f} FPS" if elapsed_sec > 0 else "N/A"
+    print(f"   Thời gian xử lý: {elapsed_sec:.1f}s  (tốc độ: {speed})")
 
     # ── 2. Kết quả phát hiện vi phạm ─────────────────────────────────────────
     violations = getattr(sidebar, "violations_history", [])
@@ -75,14 +77,11 @@ def print_summary(
     for v in violations:
         vtype_counts[_vtype(v)] += 1
 
-    # Tổng phương tiện đã quét (từ HUD tracker)
-    scanned_vehicles = getattr(violation_tracker, "scanned_count",
-                               getattr(violation_tracker, "total_vehicles_scanned", None))
     legitimate_turns = getattr(violation_tracker, "legitimate_turn_count", 0)
     red_violations   = getattr(violation_tracker, "violation_count", 0)
 
     print("\n🚨  KẾT QUẢ PHÁT HIỆN VI PHẠM")
-    print(f"   Phương tiện đã quét  : {scanned_vehicles if scanned_vehicles is not None else 'N/A'}")
+    print(f"   Phương tiện đã quét  : {scanned_vehicles}")
     print(f"   Rẽ hợp lệ            : {legitimate_turns}")
     print(f"   Vi phạm vượt đèn đỏ  : {red_violations}")
     if helmet_detector is not None:
@@ -163,6 +162,7 @@ def run(video_path: str, output_path: str = "output.mp4") -> None:
         sidebar=pipeline.sidebar,
         model_stats=model_stats,
         helmet_detector=pipeline.helmet_detector,
+        scanned_vehicles=len(pipeline.seen_track_ids),
     )
 
 
